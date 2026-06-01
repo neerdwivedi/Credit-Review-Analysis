@@ -13,7 +13,6 @@ import pandas as pd
 from data.metric_aliases import APPROVED_METRICS, NOT_DISCLOSED, TABLE1_PERIODS, TABLE2_PERIODS
 from services.normalizer import format_crore_display
 from services.reconstruction.document import DocumentContext
-from services.source_map import SourceMapContext
 from services.reconstruction.half_year import extract_half_year_financials
 from services.reconstruction.yearly import extract_yearly_financials
 from utils.constants import DOC_TYPE_ANNUAL_REPORT, DOC_TYPE_INVESTOR_PRESENTATION
@@ -32,7 +31,6 @@ class FinancialExtractionResult:
     table1_warnings: list[str] = field(default_factory=list)
     table2_warnings: list[str] = field(default_factory=list)
     validation_summary: str = ""
-    source_map_filename: str | None = None
 
 
 def _build_table_count_map(
@@ -107,7 +105,6 @@ def run_financial_extraction(
     phase1_results: list[dict[str, Any]],
     *,
     on_status: Callable[[str], None] | None = None,
-    source_map: SourceMapContext | None = None,
 ) -> FinancialExtractionResult:
     """Run V2 deterministic reconstruction on Phase 1 outputs."""
     from services.validator import (
@@ -124,13 +121,6 @@ def run_financial_extraction(
     investor: list[DocumentContext] = []
 
     _status("Preparing financial extraction from scanned documents…")
-    if source_map is not None:
-        _status("Applying analyst source map methodology…")
-        logger.info(
-            "Source map attached for extraction: %s (%d chars)",
-            source_map.filename,
-            source_map.char_count,
-        )
     for res in phase1_results:
         ctx = _context_from_phase1(res)
         if ctx is None:
@@ -173,13 +163,6 @@ def run_financial_extraction(
 
     logger.info("[V2] Total time: %.2fs", time.perf_counter() - t_total)
 
-    if source_map is not None:
-        summary = (
-            f"{summary}\n\nAnalyst source map: {source_map.filename} "
-            f"({source_map.char_count:,} characters) — methodology reference only; "
-            "extracted values unchanged."
-        )
-
     return FinancialExtractionResult(
         table1_records=table1_records,
         table2_records=table2_records,
@@ -190,5 +173,4 @@ def run_financial_extraction(
         table1_warnings=table1_warnings,
         table2_warnings=table2_warnings,
         validation_summary=summary,
-        source_map_filename=source_map.filename if source_map else None,
     )

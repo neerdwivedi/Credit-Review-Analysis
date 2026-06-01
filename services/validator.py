@@ -30,23 +30,26 @@ def _numeric_value(record: dict[str, Any]) -> float | None:
 
 
 def check_metric_sanity(metric: str, value: float) -> list[str]:
-    """Return warning messages for a single metric value if outside expected bounds."""
     warnings: list[str] = []
 
-    if metric == "Capital Adequacy Ratio" and not (0 <= value <= 100):
-        warnings.append(
-            f"Capital Adequacy Ratio {value} is outside expected range 0–100."
-        )
-    if metric == "Tier I Capital Ratio" and not (0 <= value <= 100):
-        warnings.append(f"Tier I Capital Ratio {value} is outside expected range 0–100.")
-    if metric == "ROA" and not (0 <= value <= 10):
-        warnings.append(f"ROA {value} is outside expected range 0–10.")
-    if metric == "ROE" and not (0 <= value <= 50):
-        warnings.append(f"ROE {value} is outside expected range 0–50.")
-    if metric == "Borrowings" and value < 0:
-        warnings.append(f"Borrowings {value} is negative.")
-    if metric == "Deposits" and value < 0:
-        warnings.append(f"Deposits {value} is negative.")
+    bounds: dict[str, tuple[float, float]] = {
+        "Capital Adequacy Ratio":  (0.0,  60.0),
+        "Tier I Capital Ratio":    (0.0,  60.0),
+        "ROA":                     (-5.0, 10.0),
+        "ROE":                     (-30.0, 60.0),
+        "GNPA":                    (0.0,  50.0),   # ratio in template, e.g. 1.48
+        "NNPA":                    (0.0,  30.0),   # ratio in template, e.g. 0.34
+    }
+    if metric in bounds:
+        lo, hi = bounds[metric]
+        if not (lo <= value <= hi):
+            warnings.append(
+                f"{metric} value {value:.2f} is outside expected range {lo}–{hi}."
+            )
+
+    if metric in ("Total Assets", "Borrowings", "Investments",
+                  "Advances", "Deposits") and value < 0:
+        warnings.append(f"{metric} {value:.2f} should not be negative.")
 
     return warnings
 
@@ -72,6 +75,13 @@ def validate_cross_metrics(records: list[dict[str, Any]]) -> list[str]:
         if tier1 is not None and car is not None and tier1 > car:
             warnings.append(
                 f"Tier I ({tier1}) exceeds Capital Adequacy Ratio ({car}) for period {period}."
+            )
+
+        gnpa = metrics.get("GNPA")
+        nnpa = metrics.get("NNPA")
+        if gnpa is not None and nnpa is not None and nnpa > gnpa:
+            warnings.append(
+                f"NNPA ({nnpa:.2f}%) exceeds GNPA ({gnpa:.2f}%) for {period} — verify."
             )
 
     return warnings

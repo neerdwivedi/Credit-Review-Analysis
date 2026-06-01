@@ -21,7 +21,6 @@ from docx.oxml import OxmlElement
 from data.metric_aliases import NOT_DISCLOSED, TABLE1_PERIODS, TABLE2_PERIODS
 from services.normalizer import format_crore_display, is_ratio_metric
 from services.review_manager import pivot_review_table, split_records_by_table
-from services.source_map import SourceMapContext, methodology_summary
 
 logger = logging.getLogger("credit_review")
 
@@ -83,6 +82,14 @@ def _add_table_from_dataframe(doc: Document, df, title: str) -> None:
 
 
 def _issuer_name_from_records(records: list[dict[str, Any]]) -> str:
+    # Check for explicit issuer override in session or records
+    for rec in records:
+        source = rec.get("source_filename") or rec.get("source_file") or ""
+        if "kotak mahindra bank" in source.lower():
+            return "Kotak Mahindra Bank Limited"
+        if "kotak-mahindra-bank" in source.lower():
+            return "Kotak Mahindra Bank Limited"
+
     for rec in records:
         explicit = rec.get("issuer_name") or rec.get("company_name")
         if explicit and str(explicit).strip():
@@ -185,7 +192,6 @@ def generate_credit_review_report(
     output_path: Path,
     issuer_name: str | None = None,
     on_status: Callable[[str], None] | None = None,
-    source_map: SourceMapContext | None = None,
 ) -> Path:
     """Build credit_review_report.docx at output_path."""
 
@@ -232,18 +238,6 @@ def generate_credit_review_report(
         "₹ crore unless stated otherwise. Ratios are expressed in percent. "
         "Values marked as not disclosed were not explicitly found in source documents.",
     )
-    if source_map is not None:
-        _status("Including analyst source map reference…")
-        _add_heading(doc, "Analyst Methodology Reference", level=2)
-        excerpt = methodology_summary(source_map, max_chars=3000)
-        _add_body(
-            doc,
-            f"Source map file: {source_map.filename}. "
-            "The following excerpt guides interpretation methodology only and does "
-            "not replace extracted or approved financial values.\n\n"
-            f"{excerpt}",
-        )
-
     # --- Yearly table ---
     doc.add_page_break()
     _status("Formatting yearly financial tables…")

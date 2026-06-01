@@ -40,7 +40,6 @@ from services.normalizer import (
 from services.reconstruction.similarity import score_row_match
 from services.report_generator import _issuer_name_from_records
 from services.review_manager import split_records_by_table
-from services.source_map import SourceMapContext, methodology_summary
 
 logger = logging.getLogger("credit_review")
 
@@ -125,8 +124,6 @@ def build_report_context(
     reviewed_records: list[dict[str, Any]],
     commentary: dict[str, Any],
     warnings: list[str],
-    *,
-    source_map: SourceMapContext | None = None,
 ) -> ReportContext:
     table1, table2 = split_records_by_table(reviewed_records)
     issuer = _issuer_name_from_records(reviewed_records)
@@ -139,26 +136,14 @@ def build_report_context(
         if warnings
         else "No validation warnings on approved values."
     )
-    if source_map is not None:
-        validation += (
-            f"\n\nAnalyst source map: {source_map.filename} "
-            "(methodology reference; figures unchanged)."
-        )
-    issuer_overview = (
-        f"This credit review for {issuer} uses disclosed standalone annual report "
-        "and investor presentation data. Monetary figures are ₹ crore unless "
-        "noted; ratios are in percent. 'Not disclosed' means not explicitly found."
-    )
-    if source_map is not None:
-        excerpt = methodology_summary(source_map, max_chars=500)
-        if excerpt:
-            issuer_overview += (
-                f" Methodology guidance from {source_map.filename}: {excerpt}"
-            )
     return ReportContext(
         company_name=issuer,
         report_date=datetime.now().strftime("%d %B %Y"),
-        issuer_overview=issuer_overview,
+        issuer_overview=(
+            f"This credit review for {issuer} uses disclosed standalone annual report "
+            "and investor presentation data. Monetary figures are ₹ crore unless "
+            "noted; ratios are in percent. 'Not disclosed' means not explicitly found."
+        ),
         yearly_df=pivot_template_table(table1, TABLE1_PERIODS),
         halfyear_df=pivot_template_table(table2, TABLE2_PERIODS),
         commentary_yearly=list(yearly_lines),
@@ -279,9 +264,44 @@ def _table_header_row_index(table: Table) -> tuple[int, dict[int, str], str] | N
 
 
 def _match_row_metric(label: str) -> str | None:
-    """Best canonical metric for a table row label."""
+    from data.metric_aliases import METRIC_ALIASES
     if not label or not label.strip():
         return None
+
+    # Direct hardcoded mappings for common template variants
+    DIRECT_MAP = {
+        "crar": "Capital Adequacy Ratio",
+        "crar (%)": "Capital Adequacy Ratio",
+        "crar – tier i (%)": "Tier I Capital Ratio",
+        "crar - tier i (%)": "Tier I Capital Ratio",
+        "car (%)": "Capital Adequacy Ratio",
+        "car": "Capital Adequacy Ratio",
+        "gnpa (%)": "GNPA",
+        "nnpa (%)": "NNPA",
+        "roa (%)": "ROA",
+        "roe (%)": "ROE",
+        "customer financial assets": "Advances",
+        "net worth": "Net Worth",
+    }
+
+    from services.normalizer import normalize_text
+    norm = normalize_text(label)
+    if norm in DIRECT_MAP:
+        return DIRECT_MAP[norm]
+
+    # First pass: check full alias list for exact or near-exact match
+    from services.normalizer import normalize_text
+    norm_label = normalize_text(label)
+    for metric, aliases in METRIC_ALIASES.items():
+        for alias in aliases:
+            if normalize_text(alias) == norm_label:
+                return metric
+            # Handle em-dash vs hyphen and spacing variants
+            if normalize_text(alias).replace("–", "-").replace("—", "-") == \
+               norm_label.replace("–", "-").replace("—", "-"):
+                return metric
+
+    # Second pass: fuzzy score fallback
     best_metric: str | None = None
     best_score = 0.0
     for metric in APPROVED_METRICS:
@@ -913,7 +933,7 @@ def format_enterprise_report(
     warnings: list[str],
     output_dir: Path,
     on_status: Callable[[str], None] | None = None,
-    source_map: SourceMapContext | None = None,
+    llm_sections: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Load template, inject content, save final_credit_review.docx (+ PDF if possible).
@@ -929,14 +949,67 @@ def format_enterprise_report(
     pdf_out = output_dir / FINAL_PDF_NAME
 
     _status("Loading enterprise template…")
-    ctx = build_report_context(
-        reviewed_records, commentary, warnings, source_map=source_map
-    )
+    ctx = build_report_context(reviewed_records, commentary, warnings)
     doc = Document(str(template_path))
 
     recon_log = apply_template_reconstruction(
         doc, ctx, reviewed_records, on_status=on_status
     )
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+
+        # Replace Company Profile placeholder
+        if "company profile" in text.lower() or (
+            "assessed based on disclosed" in text.lower()
+        ):
+            if llm_sections and llm_sections.get("company_profile"):
+                para.clear()
+                bold_run = para.add_run("Company Profile: ")
+                bold_run.bold = True
+                para.add_run(llm_sections["company_profile"])
+            continue
+
+        # Replace Comments date placeholders
+        import re
+        if re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", text):
+            para.clear()
+            continue
+
+        # Replace Recommendation placeholder
+        if ("recommendation" in text.lower() and
+            "fund manager" in text.lower()):
+            if llm_sections and llm_sections.get("recommendation"):
+                para.clear()
+                bold_run = para.add_run("Recommendation: ")
+                bold_run.bold = True
+                para.add_run(llm_sections["recommendation"])
+            continue
+
+    # Write Profitability, Asset Quality, Capitalisation, Liquidity
+    # after the Comments heading
+    for i, para in enumerate(doc.paragraphs):
+        if para.text.strip().lower() == "comments:":
+            section_order = [
+                ("profitability",  "Profitability"),
+                ("asset_quality",  "Asset Quality"),
+                ("capitalisation", "Capitalisation"),
+                ("liquidity",      "Liquidity"),
+            ]
+            insert_after = para._element
+            for key, label in reversed(section_order):
+                text = llm_sections.get(key, "") if llm_sections else ""
+                if not text:
+                    continue
+                from docx.oxml import OxmlElement
+                new_para = OxmlElement("w:p")
+                insert_after.addnext(new_para)
+                from docx.text.paragraph import Paragraph
+                new_p = Paragraph(new_para, para._element.getparent())
+                bold_run = new_p.add_run(f"{label}: ")
+                bold_run.bold = True
+                new_p.add_run(text)
+            break
 
     _status("Preparing DOCX export…")
     doc.save(str(docx_out))

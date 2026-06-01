@@ -18,19 +18,19 @@ from data.metric_aliases import TABLE1_PERIODS, TABLE2_PERIODS
 from services.normalizer import format_crore_display, is_ratio_metric
 from services.report_generator import _issuer_name_from_records
 from services.review_manager import split_records_by_table
-from services.source_map import SourceMapContext
 
 logger = logging.getLogger("credit_review")
 
 HALF_NEWER, HALF_OLDER = "H1FY26", "H1FY25"
 YEAR_NEWER, YEAR_OLDER = "31.03.2025", "31.03.2024"
 
-# Enterprise memo sections (order preserved). Asset Quality omitted unless data exists.
+# Enterprise memo sections (order preserved). Asset Quality inserted when disclosed.
 SECTION_ORDER: tuple[tuple[str, str], ...] = (
     ("business_profile", "Business Profile"),
-    ("profitability", "Profitability"),
-    ("capitalisation", "Capitalisation"),
-    ("liquidity", "Liquidity"),
+    ("profitability",    "Profitability"),
+    ("capitalisation",   "Capitalisation"),
+    ("asset_quality",    "Asset Quality"),
+    ("liquidity",        "Liquidity"),
 )
 
 
@@ -123,18 +123,12 @@ def _undisclosed_phrase(metrics: list[str]) -> str:
     return f"{', '.join(metrics[:-1])} and {metrics[-1]} were not disclosed."
 
 
-def _business_profile(issuer: str, source_map: SourceMapContext | None = None) -> str:
-    text = (
+def _business_profile(issuer: str) -> str:
+    return (
         f"{issuer} is assessed based on disclosed standalone annual report and "
         "investor presentation data. The following commentary summarises approved "
         "financial metrics only and does not rely on inferred or derived figures."
     )
-    if source_map is not None:
-        text += (
-            f" Analyst source map ({source_map.filename}) informs interpretation "
-            "methodology only; disclosed figures are not overridden."
-        )
-    return text
 
 
 def _profitability_section(
@@ -255,6 +249,37 @@ def _capitalisation_section(
     )
 
 
+def _asset_quality_section(
+    half: dict[tuple[str, str], float | None],
+    yearly: dict[tuple[str, str], float | None],
+) -> str | None:
+    """Returns None if no GNPA/NNPA data disclosed — section omitted."""
+    gnpa_n, gnpa_o, _, _, _ = _pair_vals(half, yearly, "GNPA")
+    nnpa_n, nnpa_o, _, _, _ = _pair_vals(half, yearly, "NNPA")
+
+    if gnpa_n is None and nnpa_n is None:
+        return None
+
+    parts = ["Asset quality metrics were disclosed for the review period."]
+    if gnpa_n is not None and gnpa_o is not None:
+        direction = "improved" if gnpa_n < gnpa_o else "moderated"
+        parts.append(
+            f"Gross NPA ratio {direction} to {gnpa_n:.2f}% from {gnpa_o:.2f}%."
+        )
+    elif gnpa_n is not None:
+        parts.append(f"Gross NPA ratio stood at {gnpa_n:.2f}%.")
+
+    if nnpa_n is not None and nnpa_o is not None:
+        direction = "improved" if nnpa_n < nnpa_o else "moderated"
+        parts.append(
+            f"Net NPA ratio {direction} to {nnpa_n:.2f}% from {nnpa_o:.2f}%."
+        )
+    elif nnpa_n is not None:
+        parts.append(f"Net NPA ratio was {nnpa_n:.2f}%.")
+
+    return " ".join(parts)
+
+
 def _liquidity_section(
     half: dict[tuple[str, str], float | None],
     yearly: dict[tuple[str, str], float | None],
@@ -292,22 +317,30 @@ def _build_sections(
     issuer: str,
     half: dict[tuple[str, str], float | None],
     yearly: dict[tuple[str, str], float | None],
-    source_map: SourceMapContext | None = None,
 ) -> list[dict[str, str]]:
     builders = {
-        "business_profile": lambda: _business_profile(issuer, source_map),
+        "business_profile": lambda: _business_profile(issuer),
         "profitability": lambda: _profitability_section(half, yearly),
         "capitalisation": lambda: _capitalisation_section(half, yearly),
         "liquidity": lambda: _liquidity_section(half, yearly),
     }
     sections: list[dict[str, str]] = []
     for section_id, title in SECTION_ORDER:
+        if section_id == "asset_quality":
+            continue
         sections.append(
             {
                 "id": section_id,
                 "title": title,
                 "paragraph": builders[section_id](),
             }
+        )
+    aq_text = _asset_quality_section(half, yearly)
+    if aq_text:
+        # Insert after capitalisation (index 2)
+        sections.insert(
+            3,
+            {"id": "asset_quality", "title": "Asset Quality", "paragraph": aq_text},
         )
     return sections
 
@@ -316,7 +349,6 @@ def generate_commentary(
     reviewed_records: list[dict[str, Any]],
     *,
     on_status: Callable[[str], None] | None = None,
-    source_map: SourceMapContext | None = None,
 ) -> dict[str, Any]:
     """
     Build institutional section commentary from approved review records.
@@ -329,8 +361,6 @@ def generate_commentary(
             on_status(msg)
 
     _status("Preparing commentary from approved extraction values…")
-    if source_map is not None:
-        _status("Applying analyst source map to commentary methodology…")
     table1, table2 = split_records_by_table(reviewed_records)
     yearly_values = _record_value_map(table1)
     half_values = _record_value_map(table2)
@@ -339,8 +369,9 @@ def generate_commentary(
     _status("Drafting business profile…")
     _status("Generating profitability commentary…")
     _status("Writing capitalisation analysis…")
+    _status("Assessing asset quality disclosure…")
     _status("Building liquidity assessment…")
-    sections = _build_sections(issuer, half_values, yearly_values, source_map)
+    sections = _build_sections(issuer, half_values, yearly_values)
     _status("Preparing credit review commentary…")
     paragraphs = [s["paragraph"] for s in sections]
     full_text = "\n\n".join(f"{s['title']}\n{s['paragraph']}" for s in sections)
@@ -349,11 +380,6 @@ def generate_commentary(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "approved_extraction",
         "rules": "institutional_sections_v2",
-        "source_map": (
-            {"filename": source_map.filename, "file_type": source_map.file_type}
-            if source_map
-            else None
-        ),
         "sections": sections,
         "paragraphs": paragraphs,
         "full_text": full_text,

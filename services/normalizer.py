@@ -174,6 +174,15 @@ def detect_unit(text: str) -> UnitType:
     if re.search(r"\b(in\s+)?millions?\b", norm) or re.search(r"₹\s*(?:in\s+)?millions?", norm):
         return "million"
 
+    # Kotak-style: "(H in thousands)" where H = rupee symbol
+    if re.search(r'\bh\s+in\s+thousands?\b', norm):
+        return "thousand"
+    if re.search(r'in\s+thousands?\b', norm):
+        return "thousand"
+    # Also catch "Rs. in thousands" and "₹ in thousands"
+    if re.search(r'(?:rs\.?|₹|inr)\s*(?:in\s+)?thousands?', norm):
+        return "thousand"
+
     return "unknown"
 
 

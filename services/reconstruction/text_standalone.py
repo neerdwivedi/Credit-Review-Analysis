@@ -83,6 +83,7 @@ def extract_from_standalone_text(
     source_section: str,
     preferred_source: bool,
 ) -> dict[str, ExtractionHit]:
+
     if not _is_standalone_financial_page(page_text):
         return {}
 
@@ -104,13 +105,34 @@ def extract_from_standalone_text(
         if row_score <= 0:
             continue
 
+        # Strategy 1: numbers on same line as label
+        # Try to find numbers embedded in the label line itself
+        import re
+        inline_nums = re.findall(r'[\d,]+(?:\.\d+)?', line.replace(' ', ''))
+
+        # Strategy 2: numbers on following lines (Kotak AR format)
+        # Collect next few non-empty lines and parse numbers from them
         values = _next_numeric_values(lines, idx + 1, len(periods))
-        if len(values) < len(periods):
-            values = _next_numeric_values(lines, idx + 2, len(periods))
+
+        # If strategy 2 found nothing, try skipping schedule number line
         if not values:
+            values = _next_numeric_values(lines, idx + 2, len(periods))
+
+        # Strategy 3: numbers are large (thousands format) —
+        # skip small integers that are schedule numbers (< 20)
+        filtered_values = []
+        for v in values:
+            if abs(v) > 100 or is_ratio_metric(metric):
+                filtered_values.append(v)
+            # Skip schedule numbers like 1, 2, 3... 18
+
+        if not filtered_values:
+            filtered_values = values  # fallback to unfiltered
+
+        if not filtered_values:
             continue
 
-        for period, raw_val in zip(periods, values[: len(periods)]):
+        for period, raw_val in zip(periods, filtered_values[:len(periods)]):
             if is_ratio_metric(metric):
                 value_original = raw_val
                 value_crore = raw_val

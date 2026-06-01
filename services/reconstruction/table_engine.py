@@ -223,6 +223,11 @@ def extract_metric_from_tables(
                 parsed = parse_numeric_value(str(raw_cell or ""))
                 if parsed is None:
                     continue
+                # Reject if value looks like a schedule/page number (small integers under 50)
+                if parsed is not None and not is_ratio_metric(metric) and abs(parsed) < 50:
+                    # Only reject if unit is not percent and value is suspiciously small
+                    if unit not in ("percent",) and abs(parsed) < 50:
+                        continue
                 if is_ratio_metric(metric) and (
                     parsed > 100 or (1900 <= abs(parsed) <= 2035)
                 ):

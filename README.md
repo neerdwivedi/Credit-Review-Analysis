@@ -1,6 +1,8 @@
-# Credit Review Report Generator — Phases 1–5
+# Credit Review Report Generator — Phases 1–6
 
 Finance-grade PDF upload, deterministic metric extraction, human review, commentary, and Word report export.
+
+**Full project guide (everything built so far):** see [PROJECT_DOCUMENTATION.md](PROJECT_DOCUMENTATION.md).
 
 **Phase 1:** PDF upload, page-wise text, document classification, table preview, logging.
 
@@ -182,8 +184,12 @@ If the filename does not match keywords, the upload slot (which field you used) 
 | Approval | Clicking Approve re-validates and upgrades clean rows to `Status = Approved` |
 | Override | User may approve despite warnings; banner reminds them |
 
-## Phase 4+ (not implemented)
+## Phase 4–6 (implemented)
 
-- Groq / LLM (writing only)
-- DOCX report generation
-- Commentary
+- Phase 4: Rule-based institutional commentary → `output/commentary.json`
+- Phase 5: Analytical `credit_review_report.docx`
+- Phase 6: Enterprise template reconstruction → `final_credit_review.docx`
+
+## Not implemented yet
+
+- Groq / OpenRouter LLM commentary rewrite

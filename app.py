@@ -39,10 +39,6 @@ from services.commentary_generator import (  # noqa: E402
     save_commentary_json,
 )
 from services.report_generator import generate_credit_review_report  # noqa: E402
-from services.source_map import (  # noqa: E402
-    SourceMapContext,
-    load_source_map_from_upload,
-)
 from services.template_formatter import (  # noqa: E402
     FINAL_DOCX_NAME,
     FINAL_PDF_NAME,
@@ -104,9 +100,6 @@ SS_TEMPLATE_NAME = "enterprise_template_name"
 SS_PHASE6_DONE = "phase6_done"
 SS_FINAL_DOCX = "final_docx_path"
 SS_FINAL_PDF = "final_pdf_path"
-SS_SOURCE_MAP_NAME = "source_map_filename"
-SS_SOURCE_MAP_TEXT = "source_map_text"
-SS_SOURCE_MAP_TYPE = "source_map_file_type"
 
 COMMENTARY_JSON_NAME = "commentary.json"
 REPORT_DOCX_NAME = "credit_review_report.docx"
@@ -133,62 +126,6 @@ def normalize_upload_list(uploaded: Any) -> list[Any]:
 def read_upload_bytes(uploaded_file: Any) -> bytes:
     uploaded_file.seek(0)
     return uploaded_file.getvalue()
-
-
-def get_source_map_from_session() -> SourceMapContext | None:
-    """Return parsed source map stored in session, if any."""
-    name = st.session_state.get(SS_SOURCE_MAP_NAME)
-    text = st.session_state.get(SS_SOURCE_MAP_TEXT)
-    if not name or not text:
-        return None
-    return SourceMapContext(
-        filename=str(name),
-        file_type=str(st.session_state.get(SS_SOURCE_MAP_TYPE) or "unknown"),
-        text=str(text),
-    )
-
-
-def store_source_map_upload(uploaded_file: Any) -> bool:
-    """Parse and persist optional analyst source map. Returns True on success."""
-    ctx = load_source_map_from_upload(uploaded_file)
-    if ctx is None:
-        return False
-    st.session_state[SS_SOURCE_MAP_NAME] = ctx.filename
-    st.session_state[SS_SOURCE_MAP_TEXT] = ctx.text
-    st.session_state[SS_SOURCE_MAP_TYPE] = ctx.file_type
-    return True
-
-
-def clear_source_map_session() -> None:
-    for key in (SS_SOURCE_MAP_NAME, SS_SOURCE_MAP_TEXT, SS_SOURCE_MAP_TYPE):
-        if key in st.session_state:
-            del st.session_state[key]
-
-
-def render_source_map_upload_ui() -> None:
-    """Fourth optional upload — analyst methodology / source map."""
-    st.markdown("---")
-    source_map_upload = st.file_uploader(
-        "Source Map / Analyst Guidance (Optional)",
-        type=["pdf", "docx", "txt"],
-        accept_multiple_files=False,
-        key="source_map_upload",
-        help="Optional methodology reference. Does not replace extracted values.",
-    )
-    st.caption(
-        "Optional: upload analyst guidance/source map to improve methodology accuracy."
-    )
-
-    if source_map_upload is not None:
-        if store_source_map_upload(source_map_upload):
-            st.success(f"Source Map uploaded: `{source_map_upload.name}`")
-        else:
-            st.error(
-                f"Could not read `{source_map_upload.name}`. "
-                "Use a non-empty PDF, DOCX, or TXT file."
-            )
-    elif st.session_state.get(SS_SOURCE_MAP_NAME):
-        st.info(f"Source Map uploaded: `{st.session_state[SS_SOURCE_MAP_NAME]}`")
 
 
 def run_extraction_for_file(
@@ -305,8 +242,6 @@ def run_full_pipeline(
     annual_files: list[Any],
     investor_files: list[Any],
     concall_files: list[Any],
-    *,
-    source_map: SourceMapContext | None = None,
 ) -> bool:
     """Execute Phase 1 + Phase 2 and store all artifacts in session_state."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,7 +264,6 @@ def run_full_pipeline(
     financial = run_financial_extraction(
         phase1_results,
         on_status=live.callback(),
-        source_map=source_map,
     )
 
     raw_records = merge_table_records(
@@ -374,9 +308,6 @@ def reset_pipeline() -> None:
         SS_PHASE6_DONE,
         SS_FINAL_DOCX,
         SS_FINAL_PDF,
-        SS_SOURCE_MAP_NAME,
-        SS_SOURCE_MAP_TEXT,
-        SS_SOURCE_MAP_TYPE,
     ):
         if key in st.session_state:
             del st.session_state[key]
@@ -685,11 +616,7 @@ def _render_phase4_commentary() -> None:
         if st.button("Generate Commentary", type="primary", key="btn_gen_commentary"):
             reviewed = st.session_state.get(SS_REVIEWED, [])
             live = LiveStatus("Commentary")
-            payload = generate_commentary(
-                reviewed,
-                on_status=live.callback(),
-                source_map=get_source_map_from_session(),
-            )
+            payload = generate_commentary(reviewed, on_status=live.callback())
             out_path = OUTPUT_DIR / COMMENTARY_JSON_NAME
             save_commentary_json(payload, out_path)
             st.session_state[SS_COMMENTARY] = payload
@@ -726,6 +653,56 @@ def _render_phase4_commentary() -> None:
             mime="application/json",
             key="dl_commentary_json",
         )
+
+    # ── LLM Commentary (Groq) ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("AI Commentary (Groq)")
+
+    groq_key = st.text_input(
+        "Groq API Key",
+        type="password",
+        placeholder="gsk_...",
+        help="Enter your Groq API key to generate AI-powered commentary",
+        key="groq_api_key_input",
+    )
+
+    if groq_key and st.button("Generate AI Commentary", key="btn_groq_commentary"):
+        from services.llm_commentary import generate_llm_commentary
+        from services.report_generator import _issuer_name_from_records
+
+        live = LiveStatus("AI Commentary")
+        try:
+            issuer = _issuer_name_from_records(
+                st.session_state.get(SS_REVIEWED, [])
+            )
+            llm_sections = generate_llm_commentary(
+                reviewed_records=st.session_state.get(SS_REVIEWED, []),
+                issuer_name=issuer,
+                api_key=groq_key,
+                on_status=live.callback(),
+            )
+            st.session_state["llm_commentary"] = llm_sections
+            live.success("AI commentary generated successfully.")
+        except Exception as e:
+            live.error(f"Commentary generation failed: {e}")
+
+    # Display generated sections if available
+    if st.session_state.get("llm_commentary"):
+        llm_sections = st.session_state["llm_commentary"]
+        section_labels = {
+            "company_profile":  "Company Profile",
+            "profitability":    "Profitability",
+            "asset_quality":    "Asset Quality",
+            "capitalisation":   "Capitalisation",
+            "liquidity":        "Liquidity",
+            "recommendation":   "Recommendation",
+        }
+        for key, label in section_labels.items():
+            if key in llm_sections:
+                st.markdown(f"**{label}**")
+                st.write(llm_sections[key])
+                st.markdown("")
+    # ──────────────────────────────────────────────────────────────────────
 
     if st.button("Regenerate Commentary", key="btn_regen_commentary"):
         st.session_state[SS_COMMENTARY_DONE] = False
@@ -765,7 +742,6 @@ def _render_phase5_report() -> None:
                 warnings=warnings,
                 output_path=report_path,
                 on_status=live.callback(),
-                source_map=get_source_map_from_session(),
             )
             st.session_state[SS_REPORT_PATH] = str(report_path)
             st.session_state[SS_REPORT_DONE] = True
@@ -865,7 +841,7 @@ def _render_phase6_formatter() -> None:
                 warnings=warnings,
                 output_dir=OUTPUT_DIR,
                 on_status=live.callback(),
-                source_map=get_source_map_from_session(),
+                llm_sections=st.session_state.get("llm_commentary"),
             )
             st.session_state[SS_FINAL_DOCX] = result["docx_path"]
             st.session_state[SS_FINAL_PDF] = result.get("pdf_path")
@@ -882,6 +858,65 @@ def _render_phase6_formatter() -> None:
 
     st.success("Enterprise report generated.")
     docx_path = Path(st.session_state.get(SS_FINAL_DOCX) or OUTPUT_DIR / FINAL_DOCX_NAME)
+
+    # ── Report Preview ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Report Preview")
+
+    with st.expander("Preview generated report before downloading", expanded=True):
+        try:
+            from docx import Document as _DocxDocument
+
+            preview_doc = _DocxDocument(str(docx_path))
+
+            # Show each section
+            current_heading = None
+            for para in preview_doc.paragraphs:
+                text = para.text.strip()
+                if not text:
+                    continue
+                # Detect headings by bold + larger font or heading style
+                is_heading = (
+                    para.style.name.startswith("Heading")
+                    or any(
+                        run.bold
+                        and run.font.size
+                        and run.font.size.pt >= 12
+                        for run in para.runs
+                        if run.text.strip()
+                    )
+                )
+                if is_heading:
+                    st.markdown(f"**{text}**")
+                else:
+                    st.write(text)
+
+            # Show tables
+            st.markdown("---")
+            st.markdown("**Financial Tables**")
+            for table_idx, table in enumerate(preview_doc.tables):
+                rows = []
+                for row in table.rows:
+                    rows.append([cell.text.strip() for cell in row.cells])
+                if rows:
+                    # First row as header
+                    try:
+                        df = pd.DataFrame(rows[1:], columns=rows[0])
+                        st.dataframe(df, use_container_width=True)
+                    except Exception:
+                        # Fallback if header row has issues
+                        df = pd.DataFrame(rows)
+                        st.dataframe(df, use_container_width=True)
+                    if table_idx >= 3:
+                        st.caption("(Further tables omitted from preview)")
+                        break
+
+        except Exception as e:
+            st.warning(f"Preview could not be rendered: {e}")
+
+    st.markdown("---")
+    # ── Download buttons follow here (existing code unchanged) ──────────────
+
     if docx_path.is_file():
         st.download_button(
             f"Download {FINAL_DOCX_NAME}",
@@ -948,8 +983,6 @@ def render_upload_screen() -> None:
             key="concall_transcript",
         )
 
-    render_source_map_upload_ui()
-
     annual_files = normalize_upload_list(annual_uploads)
     investor_files = normalize_upload_list(investor_uploads)
     concall_files = normalize_upload_list(concall_uploads)
@@ -975,13 +1008,7 @@ def render_upload_screen() -> None:
         st.error("Please upload: " + ", ".join(missing))
         return
 
-    source_map = get_source_map_from_session()
-    ok = run_full_pipeline(
-        annual_files,
-        investor_files,
-        concall_files,
-        source_map=source_map,
-    )
+    ok = run_full_pipeline(annual_files, investor_files, concall_files)
     if ok:
         st.rerun()
 
@@ -994,10 +1021,6 @@ def render_sidebar() -> None:
         st.header("Session")
         if SS_REVIEWED in st.session_state:
             st.markdown("Status: **Extraction loaded**")
-            if st.session_state.get(SS_SOURCE_MAP_NAME):
-                st.caption(
-                    f"Source map: `{st.session_state[SS_SOURCE_MAP_NAME]}`"
-                )
             if st.session_state.get(SS_APPROVED):
                 st.markdown("Approval: **Approved**")
             else:
