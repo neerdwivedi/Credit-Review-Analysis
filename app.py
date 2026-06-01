@@ -658,13 +658,23 @@ def _render_phase4_commentary() -> None:
     st.markdown("---")
     st.subheader("AI Commentary (Groq)")
 
+    # Load default key from secrets if available
+    default_key = ""
+    try:
+        default_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        pass
+
     groq_key = st.text_input(
         "Groq API Key",
+        value=default_key,
         type="password",
         placeholder="gsk_...",
-        help="Enter your Groq API key to generate AI-powered commentary",
+        help="A default key is pre-loaded. You can replace it with your own free key from console.groq.com",
         key="groq_api_key_input",
     )
+    if groq_key == default_key and default_key:
+        st.caption("Using default API key. Replace with your own from console.groq.com if needed.")
 
     if groq_key and st.button("Generate AI Commentary", key="btn_groq_commentary"):
         from services.llm_commentary import generate_llm_commentary
