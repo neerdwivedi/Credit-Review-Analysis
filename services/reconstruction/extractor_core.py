@@ -19,7 +19,7 @@ from services.reconstruction.page_index import (
     priority_sections_for,
     select_candidate_pages,
 )
-from services.reconstruction.schema import ExtractionHit, TableKind
+from services.reconstruction.schema import ExtractionHit, TableKind, compute_confidence
 from services.reconstruction.similarity import compact, score_row_match
 from services.reconstruction.table_engine import (
     extract_metric_from_tables,
@@ -164,6 +164,46 @@ def _reorder_half_year_candidates(
     return sorted(candidates, key=sort_key)
 
 
+def _vision_fallback(
+    ctx,
+    missing_metrics: list[str],
+    vision_api_key: str | None,
+) -> dict[tuple[str, str], Any]:
+    if not vision_api_key or not missing_metrics:
+        return {}
+
+    from services.vision_extractor import vision_extract_for_document
+    from data.metric_aliases import METRIC_ALIASES
+
+    candidate_pages: set[int] = set()
+    for metric in missing_metrics:
+        aliases = METRIC_ALIASES.get(metric, [metric])
+        for page_num, norm in ctx.norm_text_by_page.items():
+            if any(alias.lower() in norm for alias in aliases):
+                candidate_pages.add(page_num)
+                candidate_pages.add(page_num - 1)
+                candidate_pages.add(page_num + 1)
+    candidate_pages.update(ctx.standalone_page_set)
+    valid_pages = sorted(
+        p for p in candidate_pages if p in ctx.text_by_page
+    )[:8]
+
+    if not valid_pages:
+        return {}
+
+    logger.info(
+        "[vision_fallback] Trying vision for %s on pages %s",
+        missing_metrics, valid_pages,
+    )
+    return vision_extract_for_document(
+        pdf_bytes=ctx.pdf_bytes,
+        missing_metrics=missing_metrics,
+        candidate_pages=valid_pages,
+        api_key=vision_api_key,
+        provider="gemini",
+    )
+
+
 def extract_metric_on_document(
     ctx: DocumentContext,
     pdf: pdfplumber.PDF,
@@ -183,6 +223,7 @@ def extract_metric_on_document(
         candidates = _reorder_half_year_candidates(ctx, metric, candidates)
 
     found: dict[str, ExtractionHit] = {}
+    all_hits: list[ExtractionHit] = []
     prefer_standalone = table_kind == "yearly" and bool(ctx.standalone_page_set)
 
     for page_num in candidates:
@@ -217,6 +258,7 @@ def extract_metric_on_document(
             standalone_section=standalone,
         )
         for period, hit in hits.items():
+            all_hits.append(hit)
             if period not in found or hit.confidence > found[period].confidence:
                 found[period] = hit
 
@@ -232,14 +274,21 @@ def extract_metric_on_document(
                 preferred_source=preferred,
             )
             for period, hit in text_hits.items():
+                all_hits.append(hit)
                 if period not in found or hit.confidence > found[period].confidence:
                     found[period] = hit
 
         if len(found) >= len(periods):
+            if not hasattr(ctx, "all_extraction_hits"):
+                ctx.all_extraction_hits = []
+            ctx.all_extraction_hits.extend(all_hits)
             return found
 
     missing = [p for p in periods if p not in found]
     if not missing:
+        if not hasattr(ctx, "all_extraction_hits"):
+            ctx.all_extraction_hits = []
+        ctx.all_extraction_hits.extend(all_hits)
         return found
 
     fallback_pages = _find_fallback_pages(ctx, metric)
@@ -261,6 +310,7 @@ def extract_metric_on_document(
             standalone_section=page_num in ctx.standalone_page_set,
         )
         for period, hit in hits.items():
+            all_hits.append(hit)
             if period not in found or hit.confidence > found[period].confidence:
                 found[period] = hit
                 if period in missing:
@@ -278,6 +328,7 @@ def extract_metric_on_document(
                 preferred_source=False,
             )
             for period, hit in text_hits.items():
+                all_hits.append(hit)
                 if period not in found or hit.confidence > found[period].confidence:
                     found[period] = hit
                     if period in missing:
@@ -323,12 +374,51 @@ def extract_metric_on_document(
                 ),
                 row_label=metric,
                 used_text_fallback=True,
+                raw_text=str(val),
+                raw_text_unit=str(unit),
             )
+            all_hits.append(hit)
             if period not in found or hit.confidence > found[period].confidence:
                 found[period] = hit
                 missing.remove(period)
             break
 
+    # Vision fallback for still-missing periods
+    VISION_ENABLED = False  # per-metric vision disabled
+    # Vision now runs once per document in yearly.py and half_year.py
+
+    if VISION_ENABLED:
+        still_missing_periods = [p for p in periods if p not in found]
+        if still_missing_periods:
+            vision_key = getattr(ctx, "vision_api_key", None)
+            if vision_key:
+                vision_results = _vision_fallback(
+                    ctx, [metric], vision_key
+                )
+                for (m, p), val in vision_results.items():
+                    if p in still_missing_periods:
+                        from services.normalizer import is_ratio_metric
+                        hit = ExtractionHit(
+                            table=table_kind,
+                            metric=metric,
+                            period=p,
+                            value_original=val,
+                            unit="crore",
+                            value_crore=val,
+                            page_number=0,
+                            source_document=source_document,
+                            source_file=ctx.filename,
+                            source_section="vision_fallback",
+                            confidence=0.80,
+                            row_label=metric,
+                            used_text_fallback=False,
+                        )
+                        all_hits.append(hit)
+                        found[p] = hit
+
+    if not hasattr(ctx, "all_extraction_hits"):
+        ctx.all_extraction_hits = []
+    ctx.all_extraction_hits.extend(all_hits)
     return found
 
 

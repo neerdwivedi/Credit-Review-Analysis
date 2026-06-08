@@ -23,7 +23,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.metric_aliases import TABLE1_PERIODS, TABLE2_PERIODS  # noqa: E402
 from services.document_classifier import classify_document, display_label  # noqa: E402
 from services.extractor import run_financial_extraction  # noqa: E402
 from services.pdf_reader import (  # noqa: E402
@@ -90,6 +89,7 @@ SS_REVIEWED = "reviewed_extraction_records"
 SS_APPROVED = "extraction_approved"
 SS_WARNINGS = "review_warnings"
 SS_PHASE1 = "phase1_results"
+SS_SOURCE_MAP = "source_map"
 SS_EDITOR_VERSION = "review_editor_version"
 SS_COMMENTARY = "commentary_payload"
 SS_COMMENTARY_DONE = "commentary_done"
@@ -244,6 +244,11 @@ def run_full_pipeline(
     concall_files: list[Any],
 ) -> bool:
     """Execute Phase 1 + Phase 2 and store all artifacts in session_state."""
+    # Clear previous extraction results
+    for key in [SS_REVIEWED, SS_APPROVED, "llm_commentary"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -261,15 +266,30 @@ def run_full_pipeline(
 
     st.session_state[SS_PHASE1] = phase1_results
 
+    gemini_key = st.session_state.get("gemini_api_key", "")
+    if not gemini_key:
+        try:
+            gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:
+            pass
+    for res in phase1_results:
+        res["vision_api_key"] = gemini_key
+
     financial = run_financial_extraction(
         phase1_results,
         on_status=live.callback(),
+        source_map=st.session_state.get(SS_SOURCE_MAP),
+        fy_year=st.session_state.get("fy_year", 2026),
+        year_end_month=st.session_state.get("year_end_month", "March"),
+        h1_fy_year=st.session_state.get("h1_fy_year", st.session_state.get("fy_year", 2026)),
     )
 
     raw_records = merge_table_records(
         financial.table1_records, financial.table2_records
     )
     st.session_state[SS_RAW] = raw_records
+    st.session_state["table1_records"] = financial.table1_records
+    st.session_state["table2_records"] = financial.table2_records
     st.session_state[SS_REVIEWED] = build_review_records(raw_records)
     st.session_state[SS_APPROVED] = False
     st.session_state[SS_WARNINGS] = []
@@ -457,6 +477,12 @@ def render_review_workflow() -> None:
     if SS_REVIEWED not in st.session_state:
         return
 
+    from data.metric_aliases import get_table1_periods, get_table2_periods
+    _fy = st.session_state.get("fy_year", 2026)
+    _month = st.session_state.get("year_end_month", "March")
+    TABLE1_PERIODS = get_table1_periods(_fy, _month)
+    TABLE2_PERIODS = get_table2_periods(_fy, _month)
+
     reviewed: list[dict[str, Any]] = st.session_state[SS_REVIEWED]
     table1, table2 = split_records_by_table(reviewed)
 
@@ -489,6 +515,147 @@ def render_review_workflow() -> None:
         periods=TABLE2_PERIODS,
         editor_key=f"editor_table2_v{version}",
     )
+
+    if st.button("🔍 View Raw Extraction Data", key="btn_raw_debug"):
+        st.session_state["show_raw_debug"] = True
+
+    if st.session_state.get("show_raw_debug"):
+        import pandas as pd
+        import io
+
+        all_records = (
+            st.session_state.get("table1_records", []) +
+            st.session_state.get("table2_records", [])
+        )
+
+        raw_rows = []
+        for rec in all_records:
+            val_orig = rec.get("value_original")
+            val_crore = rec.get("value_crore")
+            unit = rec.get("unit") or "unknown"
+            raw = rec.get("raw_text") or "—"
+
+            # Build conversion explanation
+            if val_orig is not None and val_crore is not None:
+                try:
+                    if unit == "thousand":
+                        conv = f"{val_orig} ÷ 10,000 = {val_crore}"
+                    elif unit == "lakh":
+                        conv = f"{val_orig} ÷ 100 = {val_crore}"
+                    elif unit == "crore":
+                        conv = f"{val_orig} (direct) = {val_crore}"
+                    elif unit == "million":
+                        conv = f"{val_orig} × 0.1 = {val_crore}"
+                    else:
+                        conv = f"{val_orig} → {val_crore}"
+                except Exception:
+                    conv = "—"
+            else:
+                conv = "—"
+
+            raw_rows.append({
+                "Period":            rec.get("period", ""),
+                "Metric":            rec.get("metric", ""),
+                "Raw Text from PDF": raw,
+                "Unit Detected":     unit,
+                "Conversion":        conv,
+                "Final Value (cr/%)":rec.get("value_crore") or "Not Disclosed",
+                "Page No.":          rec.get("page_number") or "—",
+                "PDF Section":       rec.get("source_section") or "—",
+                "Row Label in PDF":  rec.get("row_label") or "—",
+                "Column Header":     rec.get("column_header") or "—",
+                "Confidence":        f"{float(rec.get('confidence', 0)):.2f}",
+                "Status":            rec.get("status", ""),
+                "Source File":       rec.get("source_filename") or rec.get("source_file") or "—",
+            })
+
+        if raw_rows:
+            raw_df = pd.DataFrame(raw_rows)
+
+            # Show inline with filters
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_metric = st.multiselect(
+                    "Filter by metric",
+                    options=sorted(raw_df["Metric"].unique().tolist()),
+                    default=[],
+                    key="raw_filter_metric",
+                )
+            with col2:
+                filter_status = st.multiselect(
+                    "Filter by status",
+                    options=["extracted", "missing", "Low Confidence", "Warning"],
+                    default=[],
+                    key="raw_filter_status",
+                )
+
+            filtered = raw_df.copy()
+            if filter_metric:
+                filtered = filtered[filtered["Metric"].isin(filter_metric)]
+            if filter_status:
+                filtered = filtered[
+                    filtered["Status"].str.lower().isin(
+                        [s.lower() for s in filter_status]
+                    )
+                ]
+
+            st.dataframe(filtered, use_container_width=True, height=450)
+
+            # Excel download
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                # Sheet 1: All data
+                raw_df.to_excel(
+                    writer, index=False, sheet_name="All Extracted"
+                )
+                # Sheet 2: Missing only
+                missing_df = raw_df[raw_df["Status"] == "missing"]
+                if not missing_df.empty:
+                    missing_df.to_excel(
+                        writer, index=False, sheet_name="Missing Values"
+                    )
+                # Sheet 3: Warnings only
+                warn_df = raw_df[raw_df["Status"].str.contains("Warning", case=False, na=False)]
+                if not warn_df.empty:
+                    warn_df.to_excel(
+                        writer, index=False, sheet_name="Warnings"
+                    )
+
+                all_hits_rows = []
+                for doc_ctx in st.session_state.get("doc_contexts", []):
+                    for hit in getattr(doc_ctx, "all_extraction_hits", []):
+                        all_hits_rows.append({
+                            "Metric": hit.metric,
+                            "Period": hit.period,
+                            "Value (cr/%)": hit.value_crore,
+                            "Page": hit.page_number,
+                            "Row Label in PDF": hit.row_label,
+                            "Column Header": hit.column_header,
+                            "Confidence": f"{hit.confidence:.2f}",
+                            "Section": hit.source_section,
+                            "Source File": hit.source_file,
+                        })
+
+                if all_hits_rows:
+                    all_hits_df = pd.DataFrame(all_hits_rows)
+                    all_hits_df.to_excel(
+                        writer, index=False, sheet_name="All Candidates"
+                    )
+            buffer.seek(0)
+
+            st.download_button(
+                label="📥 Download full raw extraction Excel",
+                data=buffer,
+                file_name="raw_extraction.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_raw_excel",
+            )
+
+            if st.button("Close", key="btn_close_raw"):
+                st.session_state["show_raw_debug"] = False
+                st.rerun()
+        else:
+            st.info("Run extraction first.")
 
     _render_review_action_bar(edited_t1, edited_t2, table1, table2)
     _render_warnings_panel()
@@ -675,6 +842,29 @@ def _render_phase4_commentary() -> None:
     )
     if groq_key == default_key and default_key:
         st.caption("Using default API key. Replace with your own from console.groq.com if needed.")
+
+    # Gemini API key for vision extraction fallback
+    default_gemini = ""
+    try:
+        default_gemini = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        pass
+
+    gemini_key = st.text_input(
+        "Gemini API Key (for vision extraction fallback)",
+        value=default_gemini,
+        type="password",
+        placeholder="AIza...",
+        help="Used when pdfplumber cannot extract a value. "
+             "Get free key from aistudio.google.com",
+        key="gemini_api_key_input",
+    )
+    if gemini_key == default_gemini and default_gemini:
+        st.caption(
+            "Using default Gemini key. "
+            "Replace with your own from aistudio.google.com if needed."
+        )
+    st.session_state["gemini_api_key"] = gemini_key
 
     if groq_key and st.button("Generate AI Commentary", key="btn_groq_commentary"):
         from services.llm_commentary import generate_llm_commentary
@@ -969,6 +1159,55 @@ def render_upload_screen() -> None:
         "**Yearly Financials** uses annual report(s). "
         "**Half-Year Financials** uses investor presentation(s)."
     )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        selected_fy = st.selectbox(
+            "Yearly Financial Year",
+            options=list(range(2020, 2031)),
+            index=5,
+            format_func=lambda y: f"FY{y}",
+            key="selected_fy_year",
+        )
+
+    with col2:
+        year_end_month = st.selectbox(
+            "Year-end month",
+            options=["March", "June", "September", "December"],
+            index=0,
+            key="selected_year_end_month",
+        )
+
+    with col3:
+        selected_h1_fy = st.selectbox(
+            "Half-Year Financial Year",
+            options=list(range(2020, 2031)),
+            index=6,
+            format_func=lambda y: f"H1FY{str(y)[2:]}",
+            key="selected_h1_fy_year",
+            help="Select the half-year period from your investor PPT",
+        )
+
+    st.session_state["fy_year"] = selected_fy
+    st.session_state["year_end_month"] = year_end_month
+    st.session_state["h1_fy_year"] = selected_h1_fy
+
+    from data.metric_aliases import get_table1_periods, get_table2_periods
+    t1 = get_table1_periods(selected_fy, year_end_month)
+    t2 = get_table2_periods(selected_h1_fy, year_end_month)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.info(
+            "**Yearly periods:**\n\n"
+            + "\n".join(f"• {p}" for p in t1)
+        )
+    with col2:
+        st.info(
+            "**Half-year periods:**\n\n"
+            + "\n".join(f"• {p}" for p in t2)
+        )
 
     col1, col2, col3 = st.columns(3)
     with col1:

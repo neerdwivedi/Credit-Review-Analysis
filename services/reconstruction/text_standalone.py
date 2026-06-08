@@ -40,12 +40,43 @@ def _is_standalone_financial_page(text: str) -> bool:
 
 
 def _collect_period_order(lines: list[str]) -> list[tuple[str, float]]:
-    """Return ordered unique periods as they appear in headers."""
+    import re
     seen: list[str] = []
-    for line in lines[:40]:
-        period = canonicalize_table1_period(line)
+    for line in lines[:60]:
+        clean = re.sub(
+            r'\(refer\s+note\s+\d+\)', '', line, flags=re.IGNORECASE
+        )
+        clean = re.sub(r'\(note\s+\d+\)', '', clean, flags=re.IGNORECASE)
+        clean = clean.strip()
+
+        # Existing single-period logic
+        period = canonicalize_table1_period(clean)
         if period and period not in seen:
             seen.append(period)
+
+        # Multi-period scan — finds ALL years on same line
+        # Handles any year dynamically via 20\d{2}
+        # Format 1: "March 31, 2023" or "Mar 31 2023"
+        # Format 2: "31st March 2023" or "31 March 2023"
+        # Format 3: "As at March 31, 2023"
+        # Format 4: "Year ended March 31, 2023"
+        matches = re.findall(
+            r'(?:'
+            r'(?:march|mar)[\s\.]+31[\s,\.]+(20\d{2})'  # March 31, YYYY
+            r'|'
+            r'31\s*(?:st)?\s*(?:march|mar)[\s,\.]+(20\d{2})'  # 31st March YYYY
+            r')',
+            clean,
+            re.IGNORECASE,
+        )
+        for match in matches:
+            # match is a tuple of two groups — one will be empty
+            yr = match[0] or match[1]
+            if yr:
+                p = f"31.03.{yr}"
+                if p not in seen:
+                    seen.append(p)
+
     return [(p, 1.0) for p in seen]
 
 
@@ -176,6 +207,8 @@ def extract_from_standalone_text(
                 standalone_section=True,
                 preferred_source=preferred_source,
                 unit_detected=unit_detected,
+                raw_text=str(raw_val),
+                raw_text_unit=str(effective_unit),
             )
             cur = found.get(period)
             if cur is None or hit.confidence > cur.confidence:

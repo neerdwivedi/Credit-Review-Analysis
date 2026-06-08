@@ -36,6 +36,8 @@ class ExtractionHit:
     standalone_section: bool = False
     preferred_source: bool = False
     unit_detected: bool = True
+    raw_text: str = ""
+    raw_text_unit: str = ""
 
     def to_record(self) -> dict[str, Any]:
         if is_ratio_metric(self.metric):
@@ -64,6 +66,8 @@ class ExtractionHit:
             "from_table": self.from_table,
             "row_label": self.row_label,
             "column_header": self.column_header,
+            "raw_text": self.raw_text,
+            "raw_text_unit": self.raw_text_unit,
         }
 
 

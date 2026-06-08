@@ -29,6 +29,7 @@ class DocumentContext:
     page_unit: dict[int, UnitType] = field(default_factory=dict)
     page_tables: dict[int, list[list[list[Any]]]] = field(default_factory=dict)
     fiscal_year_hint: int | None = None
+    vision_api_key: str = ""
 
     def build_indexes(self) -> None:
         for item in self.pages:

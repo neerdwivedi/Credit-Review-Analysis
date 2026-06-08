@@ -57,6 +57,20 @@ def canonicalize_table1_period(header: str | None) -> str | None:
     if norm in TABLE1_PERIOD_ALIASES:
         return TABLE1_PERIOD_ALIASES[norm]
 
+    m = re.search(
+        r"as\s+at\s+(?:31\s*(?:st)?\s*)?mar(?:ch)?[\s,]+?(20\d{2})",
+        norm
+    )
+    if m:
+        return f"31.03.{m.group(1)}"
+
+    m = re.search(
+        r"^mar(?:ch)?\s+31[\s,]+(20\d{2})$",
+        norm
+    )
+    if m:
+        return f"31.03.{m.group(1)}"
+
     # Numeric dd-mm-yyyy
     m = re.search(r"\b31[\s\./\-]+0?3[\s\./\-]+(2023|2024|2025)\b", norm)
     if m:
@@ -84,6 +98,30 @@ def canonicalize_table1_period(header: str | None) -> str | None:
     m = re.search(r"\bfy\s*['`]?\s*(?:20)?(2[3-5])\b", norm)
     if m:
         return f"31.03.20{m.group(1)}"
+
+    # June year-end: 30.06.YYYY
+    m = re.search(r"\b30[\s\./\-]+0?6[\s\./\-]+(20\d{2})\b", norm)
+    if m:
+        return f"30.06.{m.group(1)}"
+    m = re.search(r"\bjun(?:e)?\b[\s\.,-]*(20\d{2})\b", norm)
+    if m:
+        return f"30.06.{m.group(1)}"
+
+    # September year-end: 30.09.YYYY
+    m = re.search(r"\b30[\s\./\-]+0?9[\s\./\-]+(20\d{2})\b", norm)
+    if m:
+        return f"30.09.{m.group(1)}"
+    m = re.search(r"\bsep(?:tember)?\b[\s\.,-]*(20\d{2})\b", norm)
+    if m:
+        return f"30.09.{m.group(1)}"
+
+    # December year-end: 31.12.YYYY
+    m = re.search(r"\b31[\s\./\-]+1?2[\s\./\-]+(20\d{2})\b", norm)
+    if m:
+        return f"31.12.{m.group(1)}"
+    m = re.search(r"\bdec(?:ember)?\b[\s\.,-]*(20\d{2})\b", norm)
+    if m:
+        return f"31.12.{m.group(1)}"
 
     return None
 

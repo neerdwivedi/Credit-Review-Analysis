@@ -1,9 +1,3 @@
-"""
-Row-label exclusion patterns per metric (V2).
-
-Applied after fuzzy matching to reject subsidiary / divestment / contribution rows.
-"""
-
 from __future__ import annotations
 
 METRIC_ROW_EXCLUSIONS: dict[str, tuple[str, ...]] = {
@@ -15,8 +9,6 @@ METRIC_ROW_EXCLUSIONS: dict[str, tuple[str, ...]] = {
         "subsidiary",
         "divestment",
         "kgi",
-        "kgi divestment",
-        "pat on kgi",
         "shareholders",
         "minority",
         "kotak group pat",
@@ -27,18 +19,69 @@ METRIC_ROW_EXCLUSIONS: dict[str, tuple[str, ...]] = {
     "Total Income": (
         "operating income before",
         "fee and services",
-        "other income",
         "trading and mtm",
+        "rental income",
+        "other income",
+        "interest income",
+        "dividend income",
+        "fee income",
+        "commission income",
     ),
     "NII": (
         "non-interest",
         "fee income",
+        "interest earned",
+        "interest income",
+        "income from advances",
+        "schedule 13",
+        "interest and discount",
     ),
     "Deposits": (
         "deposit growth",
         "deposit mix",
+        "certificate of deposit",
+        "fixed deposit",
     ),
     "Advances": (
         "advance growth",
+        "net npa",
+        "loan against",
+        "312025",
+    ),
+    "GNPA": (
+        "gnpa ratio",
+        "gross npa ratio",
+    ),
+    "NNPA": (
+        "nnpa ratio",
+        "net npa ratio",
+    ),
+    "ROE": (
+        "book value",
+        "market cap",
+        "share price",
+        "earnings per share",
+        "eps",
+        "face value",
+        "2320",
+    ),
+    "ROA": (
+        "return on equity",
+        "roe",
+        "book value",
+        "market capitalisation",
+        "10.87",
+    ),
+    "Capital Adequacy Ratio": (
+        "return on",
+        "roa",
+        "roe",
+        "net interest margin",
+        "cost to income",
+        "102.5",
+    ),
+    "Total Assets": (
+        "net assets",
+        "return on assets",
     ),
 }

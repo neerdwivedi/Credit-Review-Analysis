@@ -20,6 +20,8 @@ APPROVED_METRICS: tuple[str, ...] = (
     "NNPA",
     "ROA",
     "ROE",
+    "Interest Earned",
+    "Interest Expended",
 )
 
 # flow   = P&L item, accumulates: Q1 + Q2 = H1
@@ -40,6 +42,8 @@ METRIC_BEHAVIOUR: dict[str, str] = {
     "NNPA":                   "ratio",   # template shows 0.34, 0.43 — percentage, not crore
     "ROA":                    "ratio",
     "ROE":                    "ratio",
+    "Interest Earned":        "flow",
+    "Interest Expended":      "flow",
 }
 
 RATIO_METRICS: frozenset[str] = frozenset(
@@ -58,8 +62,54 @@ def is_snapshot_metric(metric: str) -> bool:
 
 NOT_DISCLOSED = "Not Disclosed"
 
-TABLE1_PERIODS: tuple[str, ...] = ("31.03.2025", "31.03.2024", "31.03.2023")
-TABLE2_PERIODS: tuple[str, ...] = ("H1FY26", "H1FY25")
+MONTH_END_DAY: dict[str, tuple[str, str]] = {
+    "March":     ("03", "31"),
+    "June":      ("06", "30"),
+    "September": ("09", "30"),
+    "December":  ("12", "31"),
+}
+
+
+def get_table1_periods(
+    fy_year: int,
+    year_end_month: str = "March",
+) -> tuple[str, ...]:
+    month_num, day = MONTH_END_DAY.get(year_end_month, ("03", "31"))
+    return (
+        f"{day}.{month_num}.{fy_year}",
+        f"{day}.{month_num}.{fy_year - 1}",
+        f"{day}.{month_num}.{fy_year - 2}",
+    )
+
+
+def get_table2_periods(
+    fy_year: int,
+    year_end_month: str = "March",
+) -> tuple[str, ...]:
+    yy = fy_year % 100
+    yy_prior = (fy_year - 1) % 100
+    return (
+        f"H1FY{yy:02d}",
+        f"H1FY{yy_prior:02d}",
+    )
+
+
+def get_quarter_periods(
+    fy_year: int,
+    year_end_month: str = "March",
+) -> tuple[str, ...]:
+    yy = fy_year % 100
+    yy_prior = (fy_year - 1) % 100
+    return (
+        f"Q1FY{yy:02d}",
+        f"Q2FY{yy:02d}",
+        f"Q1FY{yy_prior:02d}",
+        f"Q2FY{yy_prior:02d}",
+    )
+
+
+TABLE1_PERIODS: tuple[str, ...] = get_table1_periods(2026, "March")
+TABLE2_PERIODS: tuple[str, ...] = get_table2_periods(2026, "March")
 
 TABLE1_PERIOD_ALIASES: dict[str, str] = {
     "31.03.2025": "31.03.2025", "31/03/2025": "31.03.2025",
@@ -165,6 +215,19 @@ METRIC_ALIASES: dict[str, list[str]] = {
     "ROE": [
         "ROE", "Return on Equity", "Return on Net Worth",
         "Return on Average Equity",
+    ],
+    "Interest Earned": [
+        "Interest Earned",
+        "Interest income",
+        "Income from advances",
+        "Interest and discount",
+        "Schedule 13",
+    ],
+    "Interest Expended": [
+        "Interest Expended",
+        "Interest expense",
+        "Interest paid",
+        "Schedule 15",
     ],
 }
 

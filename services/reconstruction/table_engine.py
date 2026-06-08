@@ -96,16 +96,32 @@ def _detect_period_anchor(
 ) -> tuple[dict[int, tuple[str, float]], int]:
     best: dict[int, tuple[str, float]] = {}
     best_idx = 0
+
     for idx in range(min(len(table), max_rows)):
         row = [str(c or "").strip() for c in table[idx]]
         prev = [str(c or "").strip() for c in table[idx - 1]] if idx > 0 else None
         mapping = _period_map_from_row(row, table_kind, prev_row=prev)
+
+        # Also try combining current row with previous row
+        # for multi-level headers like:
+        # Row 1: "As at March 31, 2024" | "As at March 31, 2023"
+        # Row 2: "No. of Shares" | "Equity share capital" | ...
+        if idx > 0 and len(mapping) == 0:
+            prev_row = [str(c or "").strip() for c in table[idx - 1]]
+            combined_mapping = _period_map_from_row(
+                prev_row, table_kind, prev_row=None
+            )
+            if len(combined_mapping) > len(best):
+                best = combined_mapping
+                best_idx = idx  # data starts at current row
+
         if len(mapping) > len(best):
             best = mapping
-            best_idx = idx
+            best_idx = idx + 1
+
     if not best:
         return {}, 0
-    return best, best_idx + 1
+    return best, best_idx
 
 
 def _table_quality_score(table: list[list[Any]], table_kind: TableKind) -> float:
@@ -220,7 +236,8 @@ def extract_metric_from_tables(
                 if col_idx >= len(row):
                     continue
                 raw_cell = row[col_idx]
-                parsed = parse_numeric_value(str(raw_cell or ""))
+                raw_text = str(raw_cell or "").strip()
+                parsed = parse_numeric_value(raw_text)
                 if parsed is None:
                     continue
                 # Reject if value looks like a schedule/page number (small integers under 50)
@@ -275,6 +292,8 @@ def extract_metric_from_tables(
                     standalone_section=standalone_section,
                     preferred_source=preferred_source,
                     unit_detected=unit_detected,
+                    raw_text=raw_text,
+                    raw_text_unit=str(effective_unit),
                 )
 
                 cur = found.get(period)

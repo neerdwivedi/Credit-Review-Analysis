@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from data.metric_aliases import APPROVED_METRICS, NOT_DISCLOSED, TABLE1_PERIODS, TABLE2_PERIODS
+from data.metric_aliases import APPROVED_METRICS, NOT_DISCLOSED
 from services.normalizer import format_crore_display
 from services.reconstruction.document import DocumentContext
 from services.reconstruction.half_year import extract_half_year_financials
@@ -105,8 +105,17 @@ def run_financial_extraction(
     phase1_results: list[dict[str, Any]],
     *,
     on_status: Callable[[str], None] | None = None,
+    source_map=None,
+    fy_year: int = 2026,
+    year_end_month: str = "March",
+    h1_fy_year: int | None = None,
 ) -> FinancialExtractionResult:
     """Run V2 deterministic reconstruction on Phase 1 outputs."""
+    from data.metric_aliases import get_table1_periods, get_table2_periods
+    TABLE1_PERIODS = get_table1_periods(fy_year, year_end_month)
+    h1_year = h1_fy_year if h1_fy_year else fy_year
+    TABLE2_PERIODS = get_table2_periods(h1_year, year_end_month)
+
     from services.validator import (
         build_human_validation_summary,
         build_validation_warnings,
@@ -123,6 +132,8 @@ def run_financial_extraction(
     _status("Preparing financial extraction from scanned documents…")
     for res in phase1_results:
         ctx = _context_from_phase1(res)
+        if ctx is not None:
+            ctx.vision_api_key = res.get("vision_api_key", "")
         if ctx is None:
             continue
         if res["doc_type"] == DOC_TYPE_ANNUAL_REPORT:
@@ -137,13 +148,21 @@ def run_financial_extraction(
     logger.info("[V2] Flow A — yearly (%d annual reports)", len(annual))
     _status("Extracting yearly financial metrics…")
     _status("Matching PAT, NII, borrowings and deposits…")
-    table1_records = extract_yearly_financials(annual)
+    table1_records = extract_yearly_financials(
+        annual,
+        periods=TABLE1_PERIODS,
+    )
 
     if investor:
         _status("Reading investor presentation…")
     logger.info("[V2] Flow B — half-year (%d presentations)", len(investor))
     _status("Extracting H1FY26 and H1FY25 values…")
-    table2_records = extract_half_year_financials(investor)
+    table2_records = extract_half_year_financials(
+        investor,
+        periods=TABLE2_PERIODS,
+        fy_year=fy_year,
+        year_end_month=year_end_month,
+    )
 
     _status("Validating extracted numbers…")
     table1_df = build_pivot_dataframe(table1_records, TABLE1_PERIODS)

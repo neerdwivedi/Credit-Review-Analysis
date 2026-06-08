@@ -253,8 +253,8 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
                 COL_METRIC: rec["metric"],
                 COL_PERIOD: rec["period"],
                 COL_EXTRACTED: (
-                    rec["extracted_value"]
-                    if rec["extracted_value"] is not None
+                    rec.get("value_crore")
+                    if rec.get("value_crore") is not None
                     else float("nan")
                 ),
                 COL_APPROVED: (
@@ -277,6 +277,73 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
                 COL_MANUAL_EDIT: bool(rec.get("manual_edit", False)),
             }
         )
+    return pd.DataFrame(rows)
+
+
+def build_provenance_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    import re
+
+    def _extract_year(period: str) -> str:
+        m = re.search(r"20(\d{2})$", period)
+        if m:
+            return m.group(1)
+        m = re.search(r"FY(\d{2})", period, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return period
+
+    rows = []
+    # Sort records ascending by period
+    sorted_records = sorted(
+        records,
+        key=lambda r: r.get("period", ""),
+    )
+
+    for rec in sorted_records:
+        period = rec.get("period", "")
+        year = _extract_year(period)
+
+        val = rec.get("value_crore")
+        raw = rec.get("raw_text") or "—"
+        unit = rec.get("unit") or "—"
+
+        if val is not None:
+            from services.normalizer import format_crore_display, is_ratio_metric
+            val_text = format_crore_display(float(val))
+            if is_ratio_metric(rec.get("metric", "")):
+                display = f"{val_text}%"
+                conversion = f"ratio = {val_text}%"
+            elif unit == "thousand":
+                conversion = f"÷10,000 = ₹{val_text} cr"
+                display = f"₹{val_text} cr"
+            elif unit == "lakh":
+                conversion = f"÷100 = ₹{val_text} cr"
+                display = f"₹{val_text} cr"
+            elif unit == "crore":
+                conversion = f"direct = ₹{val_text} cr"
+                display = f"₹{val_text} cr"
+            else:
+                conversion = f"= ₹{val_text} cr"
+                display = f"₹{val_text} cr"
+        else:
+            display = "Not Disclosed"
+            conversion = "—"
+
+        rows.append({
+            "Year":           year,
+            "Date":           period,
+            "Metric":         rec.get("metric", ""),
+            "Raw Text":       raw,
+            "Unit":           unit,
+            "Conversion":     conversion,
+            "Final Value":    display,
+            "Confidence":     f"{float(rec.get('confidence', 0)):.2f}",
+            "Status":         rec.get("status", ""),
+            "Page":           str(rec.get("page_number") or "—"),
+            "Source File":    str(rec.get("source_filename") or rec.get("source_file") or "—"),
+            "Notes":          str(rec.get("notes") or ""),
+        })
+
     return pd.DataFrame(rows)
 
 
@@ -338,32 +405,101 @@ def pivot_review_table(
     periods: tuple[str, ...],
 ) -> pd.DataFrame:
     """
-    Build a pivot DataFrame with metrics as rows and periods as columns.
-
-    Cells show the *approved* value (or "Not Disclosed") with a page hint, e.g.
-    `13720 (p.228)`. Used for the "Yearly Financials" and "Half-Year Financials"
-    sections shown above the editor.
+    Build long-format table:
+    Columns: Year | Date | Metric | Value | Status | Page | Source File
+    Rows: one row per metric per period, sorted ascending by year.
     """
-    rows: list[dict[str, Any]] = []
+    import re
+
+    def _extract_year(period: str) -> str:
+        # 31.03.2025 -> 25
+        m = re.search(r"20(\d{2})$", period)
+        if m:
+            return m.group(1)
+        # H1FY26 -> 26
+        m = re.search(r"FY(\d{2})", period, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return period
+
     by_key = {(r["metric"], r["period"]): r for r in records}
 
-    for metric in APPROVED_METRICS:
-        row: dict[str, Any] = {COL_METRIC: metric}
-        for period in periods:
+    rows = []
+    # Sort periods ascending by the year they represent
+    def _period_sort_key(period: str) -> int:
+        m = re.search(r"20(\d{2})", period)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"FY(\d{2})", period, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    sorted_periods = sorted(periods, key=_period_sort_key)
+
+    for period in sorted_periods:
+        year = _extract_year(period)
+        for metric in APPROVED_METRICS:
+            # For half-year periods show PAT only
+            is_half_year = "H1" in period or "HY" in period
+            if is_half_year and metric != "PAT":
+                continue
+
             rec = by_key.get((metric, period))
-            if rec is None:
-                row[period] = NOT_DISCLOSED
-                continue
-            if rec.get("approved_value") is None:
-                row[period] = NOT_DISCLOSED
-                continue
-            val_text = format_crore_display(float(rec["approved_value"]))
-            page = rec.get("page_number")
-            if page:
-                row[period] = f"{val_text} (p.{page})"
+            if rec is None or rec.get("approved_value") is None:
+                value = NOT_DISCLOSED
+                status = rec.get("status", "missing") if rec else "missing"
+                page = "—"
+                source = "—"
+                notes = ""
             else:
-                row[period] = val_text
-        rows.append(row)
+                val = float(rec["approved_value"])
+                val_text = format_crore_display(val)
+                if is_ratio_metric(metric):
+                    value = f"{val_text}%"
+                else:
+                    value = f"₹{val_text} cr"
+                status = rec.get("status", "")
+                page = str(rec.get("page_number") or "—")
+                source = str(
+                    rec.get("source_filename") or
+                    rec.get("source_file") or "—"
+                )
+                notes = str(rec.get("notes") or "")
+
+            # Build conversion explanation
+            unit_str = str(rec.get("unit") or "—") if rec else "—"
+            raw = str(rec.get("raw_text") or "—") if rec else "—"
+
+            if rec and rec.get("approved_value") is not None:
+                val = float(rec["approved_value"])
+                raw_val = rec.get("value_original")
+                if unit_str == "thousand" and raw_val:
+                    conversion = f"÷10,000 = ₹{format_crore_display(val)} cr"
+                elif unit_str == "lakh" and raw_val:
+                    conversion = f"÷100 = ₹{format_crore_display(val)} cr"
+                elif unit_str == "million" and raw_val:
+                    conversion = f"×0.1 = ₹{format_crore_display(val)} cr"
+                elif unit_str == "crore":
+                    conversion = f"direct = ₹{format_crore_display(val)} cr"
+                elif unit_str == "percent":
+                    conversion = f"ratio = {format_crore_display(val)}%"
+                else:
+                    conversion = f"= ₹{format_crore_display(val)} cr"
+            else:
+                conversion = "—"
+
+            rows.append({
+                "Year": year,
+                "Date": period,
+                "Metric": metric,
+                "Conversion": conversion,
+                "Final Value (Crore/%)": value,
+                "Status": status,
+                "Page": page,
+                "Source File": source,
+                "Notes": notes,
+            })
 
     return pd.DataFrame(rows)
 

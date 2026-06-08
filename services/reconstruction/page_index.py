@@ -57,6 +57,12 @@ SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "h1fy26",
         "h1 fy26",
     ),
+    "h1_balance_sheet": (
+        "balance sheet",
+        "assets and liabilities",
+        "key balance sheet",
+        "balance sheet highlights",
+    ),
 }
 
 YEARLY_METRIC_SECTIONS: dict[str, tuple[str, ...]] = {
@@ -78,15 +84,17 @@ HALF_YEAR_METRIC_SECTIONS: dict[str, tuple[str, ...]] = {
     "Total Income": ("h1_pnl", "h1_highlights", "h1_section"),
     "NII": ("h1_pnl", "h1_highlights", "h1_section"),
     "PAT": ("h1_pnl", "h1_highlights", "h1_section"),
-    "ROE": ("h1_pnl", "h1_highlights", "ratios"),
-    "ROA": ("h1_highlights", "ratios", "h1_section"),
-    "Total Assets": ("h1_highlights", "h1_section", "standalone_bs"),
-    "Borrowings": ("h1_highlights", "h1_section"),
-    "Investments": ("h1_highlights", "h1_section"),
-    "Advances": ("h1_highlights", "h1_section"),
-    "Deposits": ("h1_highlights", "h1_section"),
-    "Capital Adequacy Ratio": ("capital_adequacy", "h1_highlights", "basel"),
-    "Tier I Capital Ratio": ("capital_adequacy", "basel", "h1_highlights"),
+    "ROE": ("h1_highlights", "h1_section", "h1_pnl", "ratios"),
+    "ROA": ("h1_highlights", "h1_section", "ratios", "financial_highlights"),
+    "Total Assets": ("h1_highlights", "h1_section", "h1_pnl", "financial_highlights"),
+    "Borrowings": ("h1_highlights", "h1_section", "financial_highlights"),
+    "Investments": ("h1_highlights", "h1_section", "financial_highlights"),
+    "Advances": ("h1_highlights", "h1_section", "financial_highlights"),
+    "Deposits": ("h1_highlights", "h1_section", "financial_highlights"),
+    "Capital Adequacy Ratio": ("capital_adequacy", "h1_highlights", "h1_section", "basel"),
+    "Tier I Capital Ratio": ("capital_adequacy", "h1_highlights", "h1_section", "basel"),
+    "GNPA": ("asset_quality", "h1_highlights", "h1_section"),
+    "NNPA": ("asset_quality", "h1_highlights", "h1_section"),
 }
 
 SCORE_SECTION = 10
