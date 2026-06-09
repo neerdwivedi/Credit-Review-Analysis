@@ -67,7 +67,15 @@ def _derived_hits_to_best(
         method = info.get("method", "derived")
         key = (metric, h1_period)
         cur = current_best.get(key)
-        if cur is not None and cur.confidence >= confidence:
+        # Quarterly-derived H1 always beats direct H1 hits (avoids wrong PPT rows).
+        derived_from_quarters = method in (
+            "Q1+Q2", "Q2", "IE-IX", "PAT*2/AvgAssets", "PAT*2/AvgNW",
+        )
+        if (
+            cur is not None
+            and cur.confidence >= confidence
+            and not derived_from_quarters
+        ):
             continue
         hit = ExtractionHit(
             table="half_year",
@@ -98,17 +106,23 @@ def _derived_hits_to_best(
 def extract_half_year_financials(
     investor_presentations: list[DocumentContext],
     periods: tuple[str, ...] | None = None,
-    fy_year: int = 2026,
+    h1_fy_year: int = 2026,
     year_end_month: str = "March",
+    *,
+    fy_year: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract Table 2 (H1FY26 / H1FY25) from investor presentation PDFs only."""
+    """Extract Table 2 (H1FYxx / prior H1) from investor presentation PDFs only."""
     from data.metric_aliases import (
         TABLE2_PERIODS as _DEFAULT_PERIODS,
         get_quarter_periods,
     )
+    if fy_year is not None:
+        h1_fy_year = fy_year
     if periods is None:
         periods = _DEFAULT_PERIODS
-    QUARTER_PERIODS = get_quarter_periods(fy_year, year_end_month)
+    quarter_periods = get_quarter_periods(h1_fy_year, year_end_month)
+    # Extract H1 + Q1/Q2 (quarters used only for derivation, not shown in review)
+    extract_periods = tuple(dict.fromkeys((*periods, *quarter_periods)))
 
     t0 = time.perf_counter()
     records: list[dict[str, Any]] = []
@@ -168,7 +182,7 @@ def extract_half_year_financials(
                         doc,
                         pdf,
                         metric=metric,
-                        periods=periods,
+                        periods=extract_periods,
                         table_kind="half_year",
                         source_document=DOC_TYPE_INVESTOR_PRESENTATION,
                     )
@@ -185,14 +199,11 @@ def extract_half_year_financials(
         # to build correct H1 values (flow=Q1+Q2, snapshot=Q2, ratios=Q2).
         # This is company-agnostic — works for any bank/NBFC/HFC.
         try:
-            QUARTER_PERIODS_FY = get_quarter_periods(fy_year, year_end_month)
-            # e.g. {"Q1FY26": "...", "Q2FY26": "...", "Q1FY25": "...", "Q2FY25": "..."}
-
             for h1_label, (q1_label, q2_label) in [
-                (f"H1FY{fy_year % 100:02d}",
-                 (f"Q1FY{fy_year % 100:02d}", f"Q2FY{fy_year % 100:02d}")),
-                (f"H1FY{(fy_year-1) % 100:02d}",
-                 (f"Q1FY{(fy_year-1) % 100:02d}", f"Q2FY{(fy_year-1) % 100:02d}")),
+                (f"H1FY{h1_fy_year % 100:02d}",
+                 (f"Q1FY{h1_fy_year % 100:02d}", f"Q2FY{h1_fy_year % 100:02d}")),
+                (f"H1FY{(h1_fy_year - 1) % 100:02d}",
+                 (f"Q1FY{(h1_fy_year - 1) % 100:02d}", f"Q2FY{(h1_fy_year - 1) % 100:02d}")),
             ]:
                 q1_vals: dict[str, float | None] = {}
                 q2_vals: dict[str, float | None] = {}

@@ -20,7 +20,11 @@ from docx.oxml import OxmlElement
 
 from data.metric_aliases import NOT_DISCLOSED, TABLE1_PERIODS, TABLE2_PERIODS
 from services.normalizer import format_crore_display, is_ratio_metric
-from services.review_manager import pivot_review_table, split_records_by_table
+from services.review_manager import (
+    periods_from_records,
+    pivot_review_table,
+    split_records_by_table,
+)
 
 logger = logging.getLogger("credit_review")
 
@@ -202,8 +206,10 @@ def generate_credit_review_report(
     _status("Building analytical credit review report…")
     issuer = issuer_name or _issuer_name_from_records(reviewed_records)
     table1, table2 = split_records_by_table(reviewed_records)
-    yearly_df = pivot_review_table(table1, TABLE1_PERIODS)
-    half_df = pivot_review_table(table2, TABLE2_PERIODS)
+    t1_periods = periods_from_records(table1) or TABLE1_PERIODS
+    t2_periods = periods_from_records(table2) or TABLE2_PERIODS
+    yearly_df = pivot_review_table(table1, t1_periods)
+    half_df = pivot_review_table(table2, t2_periods)
 
     doc = Document()
     normal = doc.styles["Normal"]

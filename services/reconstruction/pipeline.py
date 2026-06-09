@@ -160,7 +160,7 @@ def run_financial_extraction(
     table2_records = extract_half_year_financials(
         investor,
         periods=TABLE2_PERIODS,
-        fy_year=fy_year,
+        h1_fy_year=h1_year,
         year_end_month=year_end_month,
     )
 

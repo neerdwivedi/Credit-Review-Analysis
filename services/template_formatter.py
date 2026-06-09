@@ -39,7 +39,7 @@ from services.normalizer import (
 )
 from services.reconstruction.similarity import score_row_match
 from services.report_generator import _issuer_name_from_records
-from services.review_manager import split_records_by_table
+from services.review_manager import periods_from_records, split_records_by_table
 
 logger = logging.getLogger("credit_review")
 
@@ -126,6 +126,8 @@ def build_report_context(
     warnings: list[str],
 ) -> ReportContext:
     table1, table2 = split_records_by_table(reviewed_records)
+    t1_periods = periods_from_records(table1) or TABLE1_PERIODS
+    t2_periods = periods_from_records(table2) or TABLE2_PERIODS
     issuer = _issuer_name_from_records(reviewed_records)
     memo_sections = commentary.get("sections", [])
     section_paragraphs = [s.get("paragraph", "") for s in memo_sections]
@@ -144,8 +146,8 @@ def build_report_context(
             "and investor presentation data. Monetary figures are ₹ crore unless "
             "noted; ratios are in percent. 'Not disclosed' means not explicitly found."
         ),
-        yearly_df=pivot_template_table(table1, TABLE1_PERIODS),
-        halfyear_df=pivot_template_table(table2, TABLE2_PERIODS),
+        yearly_df=pivot_template_table(table1, t1_periods),
+        halfyear_df=pivot_template_table(table2, t2_periods),
         commentary_yearly=list(yearly_lines),
         commentary_halfyear=list(half_lines),
         commentary_full=commentary.get("full_text", ""),
@@ -153,6 +155,64 @@ def build_report_context(
         validation_notes=validation,
         warnings=list(warnings),
     )
+
+
+def _metric_to_slug(metric: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", metric.upper()).strip("_")
+
+
+def _slugs_for_metric(metric: str) -> tuple[str, ...]:
+    """Placeholder suffixes used in enterprise templates (e.g. Y1_TOTAL_INCOME)."""
+    primary = _metric_to_slug(metric)
+    aliases: dict[str, tuple[str, ...]] = {
+        "CAPITAL_ADEQUACY_RATIO": ("CAR", "CRAR"),
+        "TIER_I_CAPITAL_RATIO": ("TIER_I", "TIER_1", "TIER_1_CAPITAL_RATIO"),
+    }
+    extra = aliases.get(primary, ())
+    return (primary, *extra)
+
+
+def build_full_placeholder_map(
+    ctx: ReportContext,
+    yearly_lookup: dict[tuple[str, str], str],
+    halfyear_lookup: dict[tuple[str, str], str],
+    t1_periods: tuple[str, ...],
+    t2_periods: tuple[str, ...],
+) -> dict[str, str]:
+    """
+    All {{TOKEN}} values for enterprise templates.
+
+    Supports per-cell tokens such as {{ISSUER}}, {{Y1_DATE}}, {{Y1_PAT}},
+    {{H1_PERIOD}}, {{H1_NII}}, etc.
+    """
+    values = _placeholder_values(ctx)
+    values["ISSUER"] = ctx.company_name
+    values["NIC_CODE"] = "—"
+    values["SECTOR"] = "—"
+    values["PREPARED_BY"] = "—"
+    values["REVIEWED_BY"] = "—"
+    if t1_periods and t2_periods:
+        values["REVIEW_PERIOD"] = f"Year ended {t1_periods[0]}; Half-year {t2_periods[0]}"
+    elif t1_periods:
+        values["REVIEW_PERIOD"] = str(t1_periods[0])
+    else:
+        values["REVIEW_PERIOD"] = ctx.report_date
+
+    for i, period in enumerate(t1_periods[:3], start=1):
+        values[f"Y{i}_DATE"] = period
+        for metric in APPROVED_METRICS:
+            val = yearly_lookup.get((metric, period), NOT_DISCLOSED)
+            for slug in _slugs_for_metric(metric):
+                values[f"Y{i}_{slug}"] = val
+
+    for i, period in enumerate(t2_periods[:2], start=1):
+        values[f"H{i}_PERIOD"] = period
+        for metric in APPROVED_METRICS:
+            val = halfyear_lookup.get((metric, period), NOT_DISCLOSED)
+            for slug in _slugs_for_metric(metric):
+                values[f"H{i}_{slug}"] = val
+
+    return values
 
 
 def build_approved_value_lookup(
@@ -382,7 +442,12 @@ def replace_title_metadata(doc: Document, ctx: ReportContext) -> list[str]:
 
     for i, paragraph in enumerate(doc.paragraphs[:15]):
         text = paragraph.text.strip()
-        if not text or "{{" in text:
+        if not text:
+            continue
+        if "{{" in text:
+            if _replace_in_paragraph(paragraph, {"ISSUER": ctx.company_name, "ISSUER_NAME": ctx.company_name, "COMPANY_NAME": ctx.company_name}):
+                log.append("Replaced issuer placeholder in title block")
+                company_set = True
             continue
         if _is_heading_paragraph(paragraph) and i > 0:
             break
@@ -403,7 +468,9 @@ def replace_title_metadata(doc: Document, ctx: ReportContext) -> list[str]:
 
     for paragraph in iter_all_paragraphs(doc):
         text = paragraph.text.strip()
-        if not text or "{{" in text:
+        if not text:
+            continue
+        if "{{" in text:
             continue
         if DATE_LINE_RE.search(text) and normalize_text(text) != normalize_text(ctx.report_date):
             _set_paragraph_text_preserve_style(paragraph, ctx.report_date)
@@ -585,20 +652,23 @@ def _paragraph_table_placeholder(paragraph: Paragraph) -> str | None:
     return None
 
 
-def apply_placeholders(doc: Document, ctx: ReportContext) -> list[str]:
+def apply_placeholders(
+    doc: Document,
+    values: dict[str, str],
+    *,
+    yearly_df: pd.DataFrame | None = None,
+    halfyear_df: pd.DataFrame | None = None,
+) -> list[str]:
     """Mode B — replace {{PLACEHOLDER}} tokens in paragraphs and table cells."""
-    values = _placeholder_values(ctx)
     log: list[str] = []
     table_style = doc.tables[0].style if doc.tables else None
 
     for paragraph in list(iter_all_paragraphs(doc)):
         tbl_key = _paragraph_table_placeholder(paragraph)
         if tbl_key:
-            df = (
-                ctx.yearly_df
-                if tbl_key == "YEARLY_TABLE"
-                else ctx.halfyear_df
-            )
+            df = yearly_df if tbl_key == "YEARLY_TABLE" else halfyear_df
+            if df is None:
+                continue
             if _paragraph_in_table_cell(paragraph):
                 lines = ["\t".join(str(c) for c in df.columns)]
                 for _, row in df.iterrows():
@@ -617,9 +687,29 @@ def apply_placeholders(doc: Document, ctx: ReportContext) -> list[str]:
             continue
 
         if _replace_in_paragraph(paragraph, values):
-            log.append(f"Replaced placeholders in: {paragraph.text[:60]}…")
+            preview = paragraph.text[:60].replace("\n", " ")
+            log.append(f"Replaced placeholders in: {preview}…")
 
     return log
+
+
+def _replace_placeholders_in_context(
+    doc: Document,
+    ctx: ReportContext,
+    reviewed_records: list[dict[str, Any]],
+) -> list[str]:
+    """Replace all {{TOKEN}} placeholders including Y1_/H1_ financial cells."""
+    table1, table2 = split_records_by_table(reviewed_records)
+    t1_periods = periods_from_records(table1) or TABLE1_PERIODS
+    t2_periods = periods_from_records(table2) or TABLE2_PERIODS
+    yearly_lookup = build_approved_value_lookup(table1)
+    halfyear_lookup = build_approved_value_lookup(table2)
+    values = build_full_placeholder_map(
+        ctx, yearly_lookup, halfyear_lookup, t1_periods, t2_periods,
+    )
+    return apply_placeholders(
+        doc, values, yearly_df=ctx.yearly_df, halfyear_df=ctx.halfyear_df,
+    )
 
 
 def _body_paragraphs(doc: Document) -> list[Paragraph]:
@@ -904,7 +994,7 @@ def apply_template_reconstruction(
     halfyear_lookup = build_approved_value_lookup(table2)
 
     _status("Applying enterprise report format…")
-    placeholders = apply_placeholders(doc, ctx)
+    placeholders = _replace_placeholders_in_context(doc, ctx, reviewed_records)
     _status("Updating issuer name and review period…")
     metadata = replace_title_metadata(doc, ctx)
     _status("Replacing financial tables…")

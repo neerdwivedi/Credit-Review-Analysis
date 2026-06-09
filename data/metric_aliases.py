@@ -165,6 +165,7 @@ METRIC_ALIASES: dict[str, list[str]] = {
         "Profit for the year", "Net profit for the year",
         "Profit/(Loss) for the year", "Profit after tax (PAT)",
         "Net Profit After Tax",
+        "PAT (₹ Cr)", "PAT (Rs Cr)", "PAT (Rs. Cr)",
     ],
     "Total Assets": [
         "Total Assets", "Balance Sheet Size", "Total Balance Sheet",
@@ -190,6 +191,9 @@ METRIC_ALIASES: dict[str, list[str]] = {
         "Loan Book",
         "Total Loans",
         "Retail loans",
+        "Consol Book",
+        "Consolidated Book",
+        "Retail Book",
     ],
     "Deposits": [
         "Deposits",
@@ -224,6 +228,7 @@ METRIC_ALIASES: dict[str, list[str]] = {
         "NNPA", "Net NPA", "Net NPA Ratio", "NNPA Ratio",
         "Net NPA %", "Net Non Performing Assets",
         "Net Non-Performing Assets",
+        "NS3%", "NS3", "Net Stage 3",
     ],
     "ROA": [
         "ROA", "Return on Assets", "Return on Average Assets",

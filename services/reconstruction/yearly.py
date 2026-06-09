@@ -29,7 +29,7 @@ logger = logging.getLogger("credit_review")
 
 def _preferred_fy_for_period(period: str) -> int | None:
     import re
-    m = re.search(r"31\.03\.(20\d{2})", period)
+    m = re.search(r"(20\d{2})$", period)
     if m:
         year = int(m.group(1))
         # Preferred source is the NEXT year's report
@@ -83,7 +83,7 @@ def _fy_from_filename(filename: str) -> int | None:
     import re
 
     name = filename.lower()
-    m = re.search(r"\b(?:fy\s*)?['`]?(2[4-6])\b", name)
+    m = re.search(r"\b(?:fy\s*)?['`]?(2[0-9])\b", name)
     if m:
         return 2000 + int(m.group(1))
     if " 25" in name or "25.pdf" in name:

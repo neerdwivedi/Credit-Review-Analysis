@@ -138,6 +138,60 @@ def canonicalize_table1_period(header: str | None) -> str | None:
     return None
 
 
+def find_all_table1_periods(header: str | None) -> list[str]:
+    """
+    Find every year-end period encoded in a header line or table cell.
+
+    Unlike canonicalize_table1_period(), this returns ALL dates on the line
+    (e.g. '31.03.2025  31.03.2024  31.03.2023') in left-to-right order.
+    """
+    if not header:
+        return []
+    text = str(header)
+    found: list[str] = []
+
+    def _add(period: str | None) -> None:
+        if period and period not in found:
+            found.append(period)
+
+    patterns = (
+        r"31[\s\./\-]+0?3[\s\./\-]+20\d{2}",
+        r"30[\s\./\-]+0?6[\s\./\-]+20\d{2}",
+        r"30[\s\./\-]+0?9[\s\./\-]+20\d{2}",
+        r"31[\s\./\-]+1?2[\s\./\-]+20\d{2}",
+        r"(?:march|mar)[\s\.]+31[\s,\.]+20\d{2}",
+        r"31\s*(?:st)?\s*(?:march|mar)[\s,\.]+20\d{2}",
+        r"(?:fy\s*)?20\d{2}\s*[-/]\s*2\d",
+        r"fy\s*['`]?\s*(?:20)?\d{2}",
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            _add(canonicalize_table1_period(m.group(0)))
+
+    if not found:
+        _add(canonicalize_table1_period(text))
+    return found
+
+
+def canonicalize_quarter_period(header: str | None) -> str | None:
+    """
+    Map investor-presentation column headers to Q1FYxx / Q2FYxx.
+
+    Used internally for H1 derivation; quarterly columns are not shown in review.
+    """
+    if not header:
+        return None
+    norm = normalize_text(header)
+    compact = re.sub(r"\s+", "", norm)
+    m = re.search(r"q([12])fy(\d{2})", compact)
+    if m:
+        return f"Q{m.group(1)}FY{m.group(2)}"
+    m = re.search(r"q([12])\s*fy\s*(\d{2})", norm)
+    if m:
+        return f"Q{m.group(1)}FY{m.group(2)}"
+    return None
+
+
 def is_table2_period_rejected(header: str | None) -> bool:
     """True if header looks like quarterly data (Q1/Q2) without half-year context."""
     if not header:
@@ -156,7 +210,7 @@ def is_table2_period_rejected(header: str | None) -> bool:
 
 def canonicalize_table2_period(header: str | None) -> str | None:
     """
-    Map investor presentation column header to H1FY26 / H1FY25, or None if invalid.
+    Map investor presentation column header to H1FYxx, or None if invalid.
     Rejects Q1/Q2-only columns per business rules.
     """
     if not header:
@@ -168,30 +222,32 @@ def canonicalize_table2_period(header: str | None) -> str | None:
     if norm in TABLE2_PERIOD_ALIASES:
         return TABLE2_PERIOD_ALIASES[norm]
 
-    if re.search(r"\bh1\s*fy\s*26\b", norm) or re.search(r"\bh1fy26\b", norm):
-        return "H1FY26"
-    if re.search(r"\bh1\s*fy\s*25\b", norm) or re.search(r"\bh1fy25\b", norm):
-        return "H1FY25"
+    compact = re.sub(r"\s+", "", norm)
 
-    # H1 2026 / H1 2025 — pure year notation
-    if re.search(r"\bh1\s*2026\b", norm):
-        return "H1FY26"
-    if re.search(r"\bh1\s*2025\b", norm):
-        return "H1FY25"
+    # H1FY26 / H1 FY 26 / H1FY24 etc.
+    m = re.search(r"h1fy(\d{2})", compact)
+    if m:
+        return f"H1FY{m.group(1)}"
+    m = re.search(r"\bh1\s*fy\s*(\d{2})\b", norm)
+    if m:
+        return f"H1FY{m.group(1)}"
 
-    # Half year ended September 2025 / 2024
-    if "half" in norm and "sep" in norm and "2025" in norm:
-        return "H1FY26"
-    if "half" in norm and "sep" in norm and "2024" in norm:
-        return "H1FY25"
-    if "september 2025" in norm and ("half" in norm or "6 month" in norm or "six month" in norm):
-        return "H1FY26"
-    if "september 2024" in norm and ("half" in norm or "6 month" in norm or "six month" in norm):
-        return "H1FY25"
-    if "half year fy26" in norm or "half-year fy26" in norm or "halfyear fy26" in norm:
-        return "H1FY26"
-    if "half year fy25" in norm or "half-year fy25" in norm or "halfyear fy25" in norm:
-        return "H1FY25"
+    # H1 2026 — calendar year in header maps to same FY label
+    m = re.search(r"\bh1\s*20(\d{2})\b", norm)
+    if m:
+        return f"H1FY{m.group(1)}"
+
+    # Half year ended September YYYY (March year-end: Sep 2024 → H1FY25)
+    m = re.search(r"(?:sep|september)\D*20(\d{2})", norm)
+    if m and any(
+        k in norm for k in ("half", "6 month", "six month", "h1", "ended")
+    ):
+        sep_yy = int(m.group(1))
+        return f"H1FY{(sep_yy + 1) % 100:02d}"
+
+    m = re.search(r"half[\s-]*year[\s-]*fy\s*(\d{2})", norm)
+    if m:
+        return f"H1FY{m.group(1)}"
 
     return None
 

@@ -13,6 +13,7 @@ from services.normalizer import (
     canonicalize_table1_period,
     convert_to_crore,
     detect_unit,
+    find_all_table1_periods,
     is_ratio_metric,
     normalize_text,
     parse_numeric_value,
@@ -49,33 +50,14 @@ def _collect_period_order(lines: list[str]) -> list[tuple[str, float]]:
         clean = re.sub(r'\(note\s+\d+\)', '', clean, flags=re.IGNORECASE)
         clean = clean.strip()
 
-        # Existing single-period logic
+        for period in find_all_table1_periods(clean):
+            if period not in seen:
+                seen.append(period)
+
+        # Legacy single-line fallback
         period = canonicalize_table1_period(clean)
         if period and period not in seen:
             seen.append(period)
-
-        # Multi-period scan — finds ALL years on same line
-        # Handles any year dynamically via 20\d{2}
-        # Format 1: "March 31, 2023" or "Mar 31 2023"
-        # Format 2: "31st March 2023" or "31 March 2023"
-        # Format 3: "As at March 31, 2023"
-        # Format 4: "Year ended March 31, 2023"
-        matches = re.findall(
-            r'(?:'
-            r'(?:march|mar)[\s\.]+31[\s,\.]+(20\d{2})'  # March 31, YYYY
-            r'|'
-            r'31\s*(?:st)?\s*(?:march|mar)[\s,\.]+(20\d{2})'  # 31st March YYYY
-            r')',
-            clean,
-            re.IGNORECASE,
-        )
-        for match in matches:
-            # match is a tuple of two groups — one will be empty
-            yr = match[0] or match[1]
-            if yr:
-                p = f"31.03.{yr}"
-                if p not in seen:
-                    seen.append(p)
 
     return [(p, 1.0) for p in seen]
 

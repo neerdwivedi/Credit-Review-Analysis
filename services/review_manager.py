@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from typing import Any, Iterable
 
 import pandas as pd
@@ -120,6 +121,7 @@ def build_review_record(raw: dict[str, Any]) -> dict[str, Any]:
     initial_approved = value_crore
 
     return {
+        "table": raw.get("table", ""),
         "metric": metric,
         "period": period,
         "extracted_value": extracted_original,
@@ -545,12 +547,45 @@ def records_to_csv_bytes(records: list[dict[str, Any]]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
+def _is_half_year_period(period: str) -> bool:
+    return bool(re.match(r"^H1FY\d{2}$", period or "", re.IGNORECASE))
+
+
+def _period_sort_key(period: str) -> int:
+    m = re.search(r"20(\d{2})$", period)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"FY(\d{2})", period, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def periods_from_records(records: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Unique periods present in records, sorted chronologically."""
+    periods = sorted(
+        {r["period"] for r in records if r.get("period")},
+        key=_period_sort_key,
+    )
+    return tuple(periods)
+
+
 def split_records_by_table(
     records: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split a flat record list into (table1, table2) based on the period."""
-    table1 = [r for r in records if r["period"] in TABLE1_PERIODS]
-    table2 = [r for r in records if r["period"] in TABLE2_PERIODS]
+    """Split a flat record list into (table1, table2) by table kind or period shape."""
+    table1: list[dict[str, Any]] = []
+    table2: list[dict[str, Any]] = []
+    for rec in records:
+        table_kind = rec.get("table")
+        if table_kind == "yearly":
+            table1.append(rec)
+        elif table_kind == "half_year":
+            table2.append(rec)
+        elif _is_half_year_period(rec.get("period", "")):
+            table2.append(rec)
+        else:
+            table1.append(rec)
     return table1, table2
 
 

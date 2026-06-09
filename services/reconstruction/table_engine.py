@@ -11,16 +11,19 @@ import pdfplumber
 
 from services.normalizer import (
     UnitType,
+    canonicalize_quarter_period,
     canonicalize_table1_period,
     canonicalize_table2_period,
     convert_to_crore,
     detect_unit,
+    find_all_table1_periods,
     is_ratio_metric,
     normalize_text,
     parse_numeric_value,
 )
 from services.reconstruction.schema import ExtractionHit, TableKind, compute_confidence
 from services.reconstruction.similarity import score_row_match
+from services.validator import check_metric_sanity
 
 logger = logging.getLogger("credit_review")
 
@@ -78,10 +81,27 @@ def _period_map_from_row(
     for col_idx, cell in enumerate(ff):
         if not cell or cell.lower() in {"particulars", "schedule", "no.", "sr no", "sr"}:
             continue
+        if table_kind == "yearly":
+            multi = find_all_table1_periods(cell)
+            if len(multi) > 1:
+                for offset, period in enumerate(multi):
+                    mapping[col_idx + offset] = (period, 1.0)
+                continue
+        if table_kind == "half_year":
+            qperiod = canonicalize_quarter_period(cell)
+            if qperiod:
+                mapping[col_idx] = (qperiod, 1.0)
+                continue
         period = canon(cell)
         col_score = 1.0 if period else 0.0
         if not period and ff_prev and col_idx < len(ff_prev) and ff_prev[col_idx]:
             combined = f"{ff_prev[col_idx]} {cell}".strip()
+            if table_kind == "yearly":
+                multi = find_all_table1_periods(combined)
+                if len(multi) > 1:
+                    for offset, period in enumerate(multi):
+                        mapping[col_idx + offset] = (period, 0.95)
+                    continue
             period = canon(combined)
             col_score = 0.95 if period else 0.0
         if period:
@@ -89,39 +109,49 @@ def _period_map_from_row(
     return mapping
 
 
+def _row_looks_like_data(row: list[str]) -> bool:
+    """True when a row has large numeric values in 2+ columns (not period headers)."""
+    numeric_cols = 0
+    for cell in row[1:]:
+        text = str(cell or "").strip()
+        if not text:
+            continue
+        if find_all_table1_periods(text) or canonicalize_table1_period(text):
+            continue
+        val = parse_numeric_value(text)
+        if val is not None and abs(val) >= 100:
+            numeric_cols += 1
+    return numeric_cols >= 2
+
+
 def _detect_period_anchor(
     table: list[list[Any]],
     table_kind: TableKind,
     max_rows: int = 10,
 ) -> tuple[dict[int, tuple[str, float]], int]:
-    best: dict[int, tuple[str, float]] = {}
-    best_idx = 0
+    """Merge period headers from all candidate header rows (supports split FY23)."""
+    merged: dict[int, tuple[str, float]] = {}
+    header_rows: list[int] = []
 
     for idx in range(min(len(table), max_rows)):
         row = [str(c or "").strip() for c in table[idx]]
+        if _row_looks_like_data(row):
+            break
+
         prev = [str(c or "").strip() for c in table[idx - 1]] if idx > 0 else None
         mapping = _period_map_from_row(row, table_kind, prev_row=prev)
 
-        # Also try combining current row with previous row
-        # for multi-level headers like:
-        # Row 1: "As at March 31, 2024" | "As at March 31, 2023"
-        # Row 2: "No. of Shares" | "Equity share capital" | ...
-        if idx > 0 and len(mapping) == 0:
-            prev_row = [str(c or "").strip() for c in table[idx - 1]]
-            combined_mapping = _period_map_from_row(
-                prev_row, table_kind, prev_row=None
-            )
-            if len(combined_mapping) > len(best):
-                best = combined_mapping
-                best_idx = idx + 1  # data starts on the row AFTER the header
+        for col_idx, val in mapping.items():
+            cur = merged.get(col_idx)
+            if cur is None or val[1] >= cur[1]:
+                merged[col_idx] = val
+        if mapping:
+            header_rows.append(idx)
 
-        if len(mapping) > len(best):
-            best = mapping
-            best_idx = idx + 1
-
-    if not best:
+    if not merged:
         return {}, 0
-    return best, best_idx
+    data_start = max(header_rows) + 1 if header_rows else 0
+    return merged, data_start
 
 
 def _table_quality_score(table: list[list[Any]], table_kind: TableKind) -> float:
@@ -248,6 +278,7 @@ def extract_metric_from_tables(
                     parsed is not None
                     and not is_ratio_metric(metric)
                     and unit not in ("percent",)
+                    and parsed != 0
                     and abs(parsed) < 20
                     and parsed == int(parsed)
                 ):
@@ -268,6 +299,10 @@ def extract_metric_from_tables(
                     if converted is None:
                         continue
                     value_crore = converted
+
+                sanity_val = value_crore if not is_ratio_metric(metric) else parsed
+                if check_metric_sanity(metric, float(sanity_val)):
+                    continue
 
                 conf = compute_confidence(
                     standalone_section=standalone_section,

@@ -643,7 +643,7 @@ def render_review_workflow() -> None:
         section_title="Yearly Financials",
         section_subtitle=(
             "From annual report — standalone, March year-end. "
-            "Columns: 31.03.2025, 31.03.2024, 31.03.2023."
+            f"Periods: {', '.join(TABLE1_PERIODS)}."
         ),
         table_records=table1,
         periods=TABLE1_PERIODS,
