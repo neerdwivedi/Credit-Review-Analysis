@@ -405,27 +405,14 @@ def pivot_review_table(
     periods: tuple[str, ...],
 ) -> pd.DataFrame:
     """
-    Build long-format table:
-    Columns: Year | Date | Metric | Value | Status | Page | Source File
-    Rows: one row per metric per period, sorted ascending by year.
+    Build a detailed provenance table matching the data_editor columns.
+    Columns: Metric | Period | Extracted Value | Approved Value |
+             Original Unit | Converted Value (Crore) | Source Document |
+             Page Number | Confidence | Status | Analyst Override
+    One row per metric per period, sorted by period ascending.
     """
     import re
 
-    def _extract_year(period: str) -> str:
-        # 31.03.2025 -> 25
-        m = re.search(r"20(\d{2})$", period)
-        if m:
-            return m.group(1)
-        # H1FY26 -> 26
-        m = re.search(r"FY(\d{2})", period, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        return period
-
-    by_key = {(r["metric"], r["period"]): r for r in records}
-
-    rows = []
-    # Sort periods ascending by the year they represent
     def _period_sort_key(period: str) -> int:
         m = re.search(r"20(\d{2})", period)
         if m:
@@ -435,73 +422,69 @@ def pivot_review_table(
             return int(m.group(1))
         return 0
 
+    by_key = {(r["metric"], r["period"]): r for r in records}
     sorted_periods = sorted(periods, key=_period_sort_key)
 
+    rows = []
     for period in sorted_periods:
-        year = _extract_year(period)
         for metric in APPROVED_METRICS:
-            # For half-year periods show PAT only
-            is_half_year = "H1" in period or "HY" in period
-            if is_half_year and metric != "PAT":
-                continue
-
             rec = by_key.get((metric, period))
+
             if rec is None or rec.get("approved_value") is None:
-                value = NOT_DISCLOSED
-                status = rec.get("status", "missing") if rec else "missing"
+                extracted = ""
+                approved = NOT_DISCLOSED
+                unit = "—"
+                converted = NOT_DISCLOSED
+                source_doc = "—"
                 page = "—"
-                source = "—"
-                notes = ""
+                confidence = ""
+                status = rec.get("status", "missing") if rec else "missing"
+                analyst_override = ""
             else:
                 val = float(rec["approved_value"])
                 val_text = format_crore_display(val)
+
                 if is_ratio_metric(metric):
-                    value = f"{val_text}%"
+                    approved = f"{val_text}%"
+                    converted = f"{val_text}%"
                 else:
-                    value = f"₹{val_text} cr"
-                status = rec.get("status", "")
+                    approved = f"₹{val_text} cr"
+                    converted = f"₹{val_text} cr"
+
+                ext_val = rec.get("extracted_value") or rec.get("value_original")
+                if ext_val is not None:
+                    try:
+                        extracted = format_crore_display(float(ext_val))
+                    except (TypeError, ValueError):
+                        extracted = str(ext_val)
+                else:
+                    extracted = "—"
+
+                unit = rec.get("original_unit") or rec.get("unit") or "—"
+                source_doc = rec.get("source_document") or "—"
                 page = str(rec.get("page_number") or "—")
-                source = str(
-                    rec.get("source_filename") or
-                    rec.get("source_file") or "—"
-                )
-                notes = str(rec.get("notes") or "")
-
-            # Build conversion explanation
-            unit_str = str(rec.get("unit") or "—") if rec else "—"
-            raw = str(rec.get("raw_text") or "—") if rec else "—"
-
-            if rec and rec.get("approved_value") is not None:
-                val = float(rec["approved_value"])
-                raw_val = rec.get("value_original")
-                if unit_str == "thousand" and raw_val:
-                    conversion = f"÷10,000 = ₹{format_crore_display(val)} cr"
-                elif unit_str == "lakh" and raw_val:
-                    conversion = f"÷100 = ₹{format_crore_display(val)} cr"
-                elif unit_str == "million" and raw_val:
-                    conversion = f"×0.1 = ₹{format_crore_display(val)} cr"
-                elif unit_str == "crore":
-                    conversion = f"direct = ₹{format_crore_display(val)} cr"
-                elif unit_str == "percent":
-                    conversion = f"ratio = {format_crore_display(val)}%"
-                else:
-                    conversion = f"= ₹{format_crore_display(val)} cr"
-            else:
-                conversion = "—"
+                confidence = f"{float(rec.get('confidence', 0)):.2f}"
+                status = rec.get("status", "")
+                analyst_override = "Yes" if rec.get("manual_edit") else ""
 
             rows.append({
-                "Year": year,
-                "Date": period,
                 "Metric": metric,
-                "Conversion": conversion,
-                "Final Value (Crore/%)": value,
-                "Status": status,
-                "Page": page,
-                "Source File": source,
-                "Notes": notes,
+                "Period": period,
+                "Extracted Value": str(extracted),
+                "Approved Value (Crore/%)": str(approved),
+                "Original Unit": str(unit),
+                "Converted Value (Crore)": str(converted),
+                "Source Document": str(source_doc),
+                "Page Number": str(page),
+                "Confidence": str(confidence),
+                "Status": str(status),
+                "Analyst Override": str(analyst_override),
             })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    return df
 
 
 def revalidate_approved(records: list[dict[str, Any]]) -> list[str]:

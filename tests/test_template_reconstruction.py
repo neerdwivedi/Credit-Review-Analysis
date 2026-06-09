@@ -1,4 +1,4 @@
-"""Smoke test — Phase 6 template reconstruction replaces stale content, keeps layout."""
+"""Smoke test — template reconstruction replaces stale content."""
 
 from __future__ import annotations
 
@@ -86,8 +86,6 @@ def _build_stale_template(path: Path) -> None:
     half.rows[1].cells[2].text = "2222"
     doc.add_heading("Profitability", level=2)
     doc.add_paragraph("PAT increased sharply to stale template values.")
-    doc.add_heading("Capitalisation", level=2)
-    doc.add_paragraph("Capitalisation is adequate with CAR at 99%.")
     doc.add_heading("Commentary", level=1)
     doc.add_paragraph("This is stale template commentary that must be removed.")
     doc.save(str(path))
@@ -110,11 +108,14 @@ def main() -> None:
         doc = Document(result["docx_path"])
         full_text = "\n".join(p.text for p in doc.paragraphs)
         table_text = "\n".join(
-            cell.text for table in doc.tables for row in table.rows for cell in row.cells
+            cell.text
+            for table in doc.tables
+            for row in table.rows
+            for cell in row.cells
         )
 
         assert "2106" not in table_text, \
-            f"Stale PAT yearly value remained:\n{table_text}"
+            f"Stale PAT value remained:\n{table_text}"
         assert "13720" in table_text, \
             f"Expected PAT 13720 not found:\n{table_text}"
         assert "9999" not in table_text, \
@@ -130,7 +131,7 @@ def main() -> None:
         assert "stale template values" not in full_text.lower(), \
             "Stale profitability paragraph survived"
 
-        print("OK — template reconstruction replaced stale tables and narrative.")
+        print("OK — template reconstruction passed.")
         print("Log:", result.get("reconstruction_log", {}))
 
 

@@ -113,7 +113,7 @@ def _detect_period_anchor(
             )
             if len(combined_mapping) > len(best):
                 best = combined_mapping
-                best_idx = idx  # data starts at current row
+                best_idx = idx + 1  # data starts on the row AFTER the header
 
         if len(mapping) > len(best):
             best = mapping
@@ -240,11 +240,18 @@ def extract_metric_from_tables(
                 parsed = parse_numeric_value(raw_text)
                 if parsed is None:
                     continue
-                # Reject if value looks like a schedule/page number (small integers under 50)
-                if parsed is not None and not is_ratio_metric(metric) and abs(parsed) < 50:
-                    # Only reject if unit is not percent and value is suspiciously small
-                    if unit not in ("percent",) and abs(parsed) < 50:
-                        continue
+                # Reject only whole-number integers under 20 — these are
+                # schedule reference numbers or page numbers (e.g. Note 4,
+                # page 12). Do NOT reject values >= 20: small but real
+                # financial figures can legitimately be under 50 cr.
+                if (
+                    parsed is not None
+                    and not is_ratio_metric(metric)
+                    and unit not in ("percent",)
+                    and abs(parsed) < 20
+                    and parsed == int(parsed)
+                ):
+                    continue
                 if is_ratio_metric(metric) and (
                     parsed > 100 or (1900 <= abs(parsed) <= 2035)
                 ):

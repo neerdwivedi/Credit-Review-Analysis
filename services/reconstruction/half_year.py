@@ -20,6 +20,12 @@ from services.reconstruction.extractor_core import (
 )
 from services.reconstruction.schema import missing_record
 from utils.constants import DOC_TYPE_INVESTOR_PRESENTATION
+from services.llm_extractor import (
+    llm_extract_document,
+    is_groq_available,
+)
+from data.financial_logic import derive_h1_values, METRIC_TYPE, MetricType
+from data.metric_aliases import get_quarter_periods
 
 logger = logging.getLogger("credit_review")
 
@@ -36,6 +42,57 @@ def _prefer_half_year_hit(
     if new_hit.confidence > current.confidence + 0.08:
         return True
     return False
+
+
+def _derived_hits_to_best(
+    derived: dict[str, dict],
+    *,
+    h1_period: str,
+    source_file: str,
+    source_document: str,
+    current_best: dict[tuple[str, str], Any],
+) -> None:
+    """
+    Write derived H1 values into current_best dict in-place.
+    Only writes if no existing hit or derived confidence is higher.
+    """
+    from services.reconstruction.schema import ExtractionHit
+    from services.normalizer import is_ratio_metric
+
+    for metric, info in derived.items():
+        value = info.get("value")
+        if value is None:
+            continue
+        confidence = float(info.get("confidence", 0.8))
+        method = info.get("method", "derived")
+        key = (metric, h1_period)
+        cur = current_best.get(key)
+        if cur is not None and cur.confidence >= confidence:
+            continue
+        hit = ExtractionHit(
+            table="half_year",
+            metric=metric,
+            period=h1_period,
+            value_original=value,
+            unit="percent" if is_ratio_metric(metric) else "crore",
+            value_crore=value,
+            page_number=0,
+            source_document=source_document,
+            source_file=source_file,
+            source_section=f"derived:{method}",
+            confidence=confidence,
+            row_label=metric,
+            column_header=h1_period,
+            row_score=1.0,
+            column_score=1.0,
+            from_table=False,
+            standalone_section=True,
+            preferred_source=True,
+            unit_detected=True,
+            raw_text=str(value),
+            raw_text_unit="crore",
+        )
+        current_best[key] = hit
 
 
 def extract_half_year_financials(
@@ -71,6 +128,36 @@ def extract_half_year_financials(
                 )
         return records
 
+    # ── LLM extraction pass ───────────────────────────────────────────────
+    groq_key = None
+    for doc in investor_presentations:
+        k = getattr(doc, "vision_api_key", None) or ""
+        if is_groq_available(k):
+            groq_key = k
+            break
+
+    if groq_key:
+        for doc in investor_presentations:
+            prepare_document(doc, "half_year")
+            llm_hits = llm_extract_document(
+                doc.pages,
+                groq_api_key=groq_key,
+                table_kind="half_year",
+                source_document=DOC_TYPE_INVESTOR_PRESENTATION,
+                source_file=doc.filename,
+                allowed_periods=periods,
+            )
+            for hit in llm_hits:
+                key = (hit.metric, hit.period)
+                cur = best.get(key)
+                if cur is None or hit.confidence > cur.confidence:
+                    best[key] = hit
+        logger.info(
+            "[half_year] LLM pre-pass: %d values seeded",
+            sum(1 for v in best.values() if v is not None),
+        )
+    # ── end LLM pass ─────────────────────────────────────────────────────
+
     for doc in investor_presentations:
         prepare_document(doc, "half_year")
         logger.info("[half_year] Processing %s (%d pages)", doc.filename, len(doc.pages))
@@ -92,6 +179,54 @@ def extract_half_year_financials(
                             best[key] = hit
         except Exception as exc:
             logger.exception("[half_year] Failed on %s: %s", doc.filename, exc)
+
+        # ── Q1/Q2 derivation pass ─────────────────────────────────────
+        # Extract Q1 and Q2 separately, then use financial_logic rules
+        # to build correct H1 values (flow=Q1+Q2, snapshot=Q2, ratios=Q2).
+        # This is company-agnostic — works for any bank/NBFC/HFC.
+        try:
+            QUARTER_PERIODS_FY = get_quarter_periods(fy_year, year_end_month)
+            # e.g. {"Q1FY26": "...", "Q2FY26": "...", "Q1FY25": "...", "Q2FY25": "..."}
+
+            for h1_label, (q1_label, q2_label) in [
+                (f"H1FY{fy_year % 100:02d}",
+                 (f"Q1FY{fy_year % 100:02d}", f"Q2FY{fy_year % 100:02d}")),
+                (f"H1FY{(fy_year-1) % 100:02d}",
+                 (f"Q1FY{(fy_year-1) % 100:02d}", f"Q2FY{(fy_year-1) % 100:02d}")),
+            ]:
+                q1_vals: dict[str, float | None] = {}
+                q2_vals: dict[str, float | None] = {}
+
+                for metric in APPROVED_METRICS:
+                    q1_hit = best.get((metric, q1_label))
+                    q2_hit = best.get((metric, q2_label))
+                    q1_vals[metric] = q1_hit.value_crore if q1_hit else None
+                    q2_vals[metric] = q2_hit.value_crore if q2_hit else None
+
+                # Only derive if we have at least some quarterly data
+                has_data = any(
+                    v is not None
+                    for v in list(q1_vals.values()) + list(q2_vals.values())
+                )
+                if not has_data:
+                    continue
+
+                derived = derive_h1_values(q1_vals, q2_vals)
+                _derived_hits_to_best(
+                    derived,
+                    h1_period=h1_label,
+                    source_file=doc.filename,
+                    source_document=DOC_TYPE_INVESTOR_PRESENTATION,
+                    current_best=best,
+                )
+                logger.info(
+                    "[half_year] Q1/Q2 derivation for %s: %d metrics derived",
+                    h1_label,
+                    sum(1 for v in derived.values() if v.get("value") is not None),
+                )
+        except Exception as exc:
+            logger.warning("[half_year] Q1/Q2 derivation failed: %s", exc)
+        # ── end derivation pass ───────────────────────────────────────
 
     # Single Gemini vision call for ALL missing H1 metrics at once
     vision_key = None

@@ -48,7 +48,17 @@ def canonicalize_table1_period(header: str | None) -> str | None:
     """
     if not header:
         return None
-    norm = normalize_text(header)
+    # Strip note references, audit qualifiers and parenthetical suffixes
+    # before normalising — e.g. "March 31, 2023 (Refer note 55)" → "March 31, 2023"
+    import re as _re
+    cleaned = _re.sub(
+        r'\(\s*(?:refer\s+)?(?:note|notes|schedule|see note|restated|audited|'
+        r'unaudited|revised|refer|as restated|formerly)[^)]*\)',
+        '',
+        str(header),
+        flags=_re.IGNORECASE,
+    ).strip()
+    norm = normalize_text(cleaned)
 
     # Substring rejection for any Table-2 quarter wording leaking into Table 1
     if "h1" in norm or "half year" in norm or "half-year" in norm:
@@ -72,30 +82,32 @@ def canonicalize_table1_period(header: str | None) -> str | None:
         return f"31.03.{m.group(1)}"
 
     # Numeric dd-mm-yyyy
-    m = re.search(r"\b31[\s\./\-]+0?3[\s\./\-]+(2023|2024|2025)\b", norm)
+    m = re.search(r"\b31[\s\./\-]+0?3[\s\./\-]+(20\d{2})\b", norm)
     if m:
         return f"31.03.{m.group(1)}"
 
     # "31 March 2025" / "31st March 2025" / "March 31, 2025"
-    m = re.search(r"\b31\s*(?:st)?\s*mar(?:ch)?\b[\s\.,-]*(2023|2024|2025)\b", norm)
+    m = re.search(r"\b31\s*(?:st)?\s*mar(?:ch)?\b[\s\.,-]*(20\d{2})\b", norm)
     if m:
         return f"31.03.{m.group(1)}"
-    m = re.search(r"\bmar(?:ch)?\s*31[\s\.,-]*(2023|2024|2025)\b", norm)
+    m = re.search(r"\bmar(?:ch)?\s*31[\s\.,-]*(20\d{2})\b", norm)
     if m:
         return f"31.03.{m.group(1)}"
 
     # "March 2025" or "Mar 2025" (no day)
-    m = re.search(r"\bmar(?:ch)?\b[\s\.,-]*(2023|2024|2025)\b", norm)
+    m = re.search(r"\bmar(?:ch)?\b[\s\.,-]*(20\d{2})\b", norm)
     if m:
         return f"31.03.{m.group(1)}"
 
     # "FY24-25", "2024-25", "2023-24", "2022-23"
-    m = re.search(r"\b(?:fy\s*)?(202[2-4])\s*[-/]\s*(2[3-5])\b", norm)
+    m = re.search(r"\b(?:fy\s*)?(20\d{2})\s*[-/]\s*(2\d)\b", norm)
     if m:
-        return f"31.03.20{m.group(2)}"
+        year2 = int(m.group(2))
+        full_year = 2000 + year2
+        return f"31.03.{full_year}"
 
     # FY25 / FY 25 / FY'25 / FY 2025
-    m = re.search(r"\bfy\s*['`]?\s*(?:20)?(2[3-5])\b", norm)
+    m = re.search(r"\bfy\s*['`]?\s*(?:20)?(\d{2})\b", norm)
     if m:
         return f"31.03.20{m.group(1)}"
 

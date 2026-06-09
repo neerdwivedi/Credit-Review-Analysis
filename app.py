@@ -72,6 +72,7 @@ from utils.live_status import LiveStatus  # noqa: E402
 from utils.constants import (  # noqa: E402
     ALLOWED_EXTENSIONS,
     DATA_DIR,
+    UPLOADS_DIR,
     DOC_TYPE_ANNUAL_REPORT,
     DOC_TYPE_CONCALL_TRANSCRIPT,
     DOC_TYPE_INVESTOR_PRESENTATION,
@@ -136,7 +137,7 @@ def run_extraction_for_file(
     filename = uploaded_file.name
     pdf_bytes = read_upload_bytes(uploaded_file)
     try:
-        saved_path = save_uploaded_pdf(pdf_bytes, filename, DATA_DIR)
+        saved_path = save_uploaded_pdf(pdf_bytes, filename, UPLOADS_DIR)
         pages = extract_pages_from_pdf(pdf_bytes, filename)
         doc_type = classify_document(filename, upload_slot=upload_slot)
         table_preview = preview_tables_in_pdf(pdf_bytes, filename)
@@ -250,7 +251,7 @@ def run_full_pipeline(
             del st.session_state[key]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
     queue = build_extraction_queue(annual_files, investor_files, concall_files)
     logger.info("Starting Phase 1 — %d file(s)", len(queue))
@@ -272,8 +273,20 @@ def run_full_pipeline(
             gemini_key = st.secrets.get("GEMINI_API_KEY", "")
         except Exception:
             pass
+
+    groq_key = st.session_state.get("groq_api_key", "")
+    if not groq_key:
+        try:
+            groq_key = st.secrets.get("GROQ_API_KEY", "")
+        except Exception:
+            pass
+
     for res in phase1_results:
         res["vision_api_key"] = gemini_key
+        # Reuse vision_api_key slot for groq when groq key is present
+        # llm_extractor.py checks is_groq_available() which validates gsk_ prefix
+        if groq_key and groq_key.strip().startswith("gsk_"):
+            res["vision_api_key"] = groq_key
 
     financial = run_financial_extraction(
         phase1_results,
@@ -307,6 +320,59 @@ def run_full_pipeline(
     # Persist a copy of the validation summary to disk (audit trail)
     summary_path = OUTPUT_DIR / "validation_summary.txt"
     summary_path.write_text(financial.validation_summary, encoding="utf-8")
+
+    # ── Process any uploaded screenshots ─────────────────────────────────
+    groq_key = st.session_state.get("groq_api_key", "")
+    ann_shots = st.session_state.get("annual_screenshots_data", [])
+    inv_shots = st.session_state.get("investor_screenshots_data", [])
+    all_shots = list(ann_shots) + list(inv_shots)
+
+    if all_shots and groq_key:
+        from services.screenshot_extractor import (
+            extract_from_screenshot,
+            screenshot_to_review_records,
+        )
+        from data.metric_aliases import get_table1_periods, get_table2_periods
+        _fy = st.session_state.get("fy_year", 2026)
+        _month = st.session_state.get("year_end_month", "March")
+        all_periods = (
+            get_table1_periods(_fy, _month) +
+            get_table2_periods(_fy, _month)
+        )
+        live.update("Extracting values from uploaded screenshots…")
+        reviewed = st.session_state.get(SS_REVIEWED, [])
+        total_found = 0
+        for img_file in all_shots:
+            img_bytes = img_file.read()
+            ext = img_file.name.split(".")[-1].lower()
+            fmt = "jpeg" if ext in ("jpg", "jpeg") else ext
+            result = extract_from_screenshot(img_bytes, groq_key, fmt)
+            if not result:
+                continue
+            new_records = screenshot_to_review_records(
+                result,
+                source_file=img_file.name,
+                allowed_periods=all_periods,
+            )
+            by_key = {
+                (r["metric"], r["period"]): i
+                for i, r in enumerate(reviewed)
+            }
+            for new_rec in new_records:
+                key = (new_rec["metric"], new_rec["period"])
+                if key in by_key:
+                    idx = by_key[key]
+                    if reviewed[idx].get("approved_value") is None:
+                        reviewed[idx].update(new_rec)
+                        total_found += 1
+                else:
+                    reviewed.append(new_rec)
+                    total_found += 1
+        if total_found > 0:
+            st.session_state[SS_REVIEWED] = reviewed
+            live.update(f"Screenshots added {total_found} values.")
+    # ── end screenshot processing ─────────────────────────────────────────
+
     live.success("Extraction complete — review and approve tables below.")
     return True
 
@@ -469,6 +535,85 @@ def _render_review_editor(
             COL_SOURCE_FILE,
         ],
     )
+
+    # ── Screenshot upload for missing values ──────────────────────────────
+    missing_metrics = [
+        rec["metric"] for rec in table_records
+        if rec.get("approved_value") is None
+    ]
+    if missing_metrics:
+        with st.expander(
+            f"📷 Upload screenshots for missing values ({len(missing_metrics)} missing)",
+            expanded=False,
+        ):
+            st.caption(
+                "Upload a photo or screenshot of the exact page in the PDF "
+                "that contains the missing values. Groq Vision will extract "
+                "the numbers directly from the image."
+            )
+            screenshot_files = st.file_uploader(
+                "Upload page screenshots (JPG, PNG)",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True,
+                key=f"screenshots_{editor_key}",
+            )
+            groq_key = st.session_state.get("groq_api_key", "")
+            if screenshot_files and groq_key:
+                if st.button(
+                    "Extract from screenshots",
+                    key=f"btn_screenshot_{editor_key}",
+                ):
+                    from services.screenshot_extractor import (
+                        extract_from_screenshot,
+                        screenshot_to_review_records,
+                    )
+                    from data.metric_aliases import get_table1_periods, get_table2_periods
+                    _fy = st.session_state.get("fy_year", 2026)
+                    _month = st.session_state.get("year_end_month", "March")
+                    all_periods = (
+                        get_table1_periods(_fy, _month) +
+                        get_table2_periods(_fy, _month)
+                    )
+                    total_found = 0
+                    for img_file in screenshot_files:
+                        img_bytes = img_file.read()
+                        ext = img_file.name.split(".")[-1].lower()
+                        fmt = "jpeg" if ext in ("jpg", "jpeg") else ext
+                        with st.spinner(f"Reading {img_file.name}…"):
+                            result = extract_from_screenshot(
+                                img_bytes, groq_key, fmt
+                            )
+                        if not result:
+                            st.warning(f"Could not extract from {img_file.name}")
+                            continue
+                        new_records = screenshot_to_review_records(
+                            result,
+                            source_file=img_file.name,
+                            allowed_periods=all_periods,
+                        )
+                        # Merge into reviewed records
+                        reviewed = st.session_state.get(SS_REVIEWED, [])
+                        by_key = {
+                            (r["metric"], r["period"]): i
+                            for i, r in enumerate(reviewed)
+                        }
+                        for new_rec in new_records:
+                            key = (new_rec["metric"], new_rec["period"])
+                            if key in by_key:
+                                idx = by_key[key]
+                                if reviewed[idx].get("approved_value") is None:
+                                    reviewed[idx].update(new_rec)
+                                    total_found += 1
+                        st.session_state[SS_REVIEWED] = reviewed
+                    if total_found > 0:
+                        st.success(f"Extracted {total_found} values from screenshots.")
+                        st.rerun()
+                    else:
+                        st.info("No new values found in screenshots.")
+            elif screenshot_files and not groq_key:
+                st.warning("Enter your Groq API key above to extract from screenshots.")
+    # ── end screenshot upload ─────────────────────────────────────────────
+
     return edited_df
 
 
@@ -1217,6 +1362,14 @@ def render_upload_screen() -> None:
             accept_multiple_files=True,
             key="annual_report",
         )
+        annual_screenshots = st.file_uploader(
+            "Or upload page screenshots (JPG/PNG)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="annual_screenshots",
+            help="Upload photos or screenshots of specific financial pages "
+                 "if you don't have the full PDF.",
+        )
     with col2:
         investor_uploads = st.file_uploader(
             "Investor Presentation PDFs (required)",
@@ -1224,9 +1377,16 @@ def render_upload_screen() -> None:
             accept_multiple_files=True,
             key="investor_presentation",
         )
+        investor_screenshots = st.file_uploader(
+            "Or upload page screenshots (JPG/PNG)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="investor_screenshots",
+            help="Upload screenshots of H1 results pages if no full PPT available.",
+        )
     with col3:
         concall_uploads = st.file_uploader(
-            "Concall Transcript PDFs (optional — not used for metric extraction)",
+            "Concall Transcript PDFs (optional)",
             type=["pdf"],
             accept_multiple_files=True,
             key="concall_transcript",
@@ -1235,12 +1395,42 @@ def render_upload_screen() -> None:
     annual_files = normalize_upload_list(annual_uploads)
     investor_files = normalize_upload_list(investor_uploads)
     concall_files = normalize_upload_list(concall_uploads)
+    # Store screenshots in session state for post-extraction processing
+    st.session_state["annual_screenshots_data"] = annual_screenshots or []
+    st.session_state["investor_screenshots_data"] = investor_screenshots or []
 
-    if annual_files or investor_files or concall_files:
+    ann_imgs = len(annual_screenshots) if annual_screenshots else 0
+    inv_imgs = len(investor_screenshots) if investor_screenshots else 0
+    if annual_files or investor_files or concall_files or ann_imgs or inv_imgs:
         st.caption(
-            f"Ready: {len(annual_files)} annual, "
-            f"{len(investor_files)} investor, {len(concall_files)} concall PDF(s)."
+            f"Ready: {len(annual_files)} annual PDF(s), "
+            f"{len(investor_files)} investor PDF(s), "
+            f"{len(concall_files)} concall PDF(s)"
+            + (f", {ann_imgs} annual screenshot(s)" if ann_imgs else "")
+            + (f", {inv_imgs} investor screenshot(s)" if inv_imgs else "")
+            + "."
         )
+
+    st.divider()
+    st.subheader("AI Extraction (Recommended)")
+    st.caption(
+        "Groq LLM extraction works for any company — banks, NBFCs, HFCs. "
+        "Free key from console.groq.com (takes 30 seconds to get)."
+    )
+    default_groq = ""
+    try:
+        default_groq = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        pass
+    groq_key_upload = st.text_input(
+        "Groq API Key",
+        value=default_groq,
+        type="password",
+        placeholder="gsk_...",
+        help="Used for LLM-based extraction. Falls back to pdfplumber if not provided.",
+        key="groq_api_key_upload",
+    )
+    st.session_state["groq_api_key"] = groq_key_upload
 
     run_clicked = st.button("Run Extraction", type="primary")
 
@@ -1249,10 +1439,10 @@ def render_upload_screen() -> None:
         return
 
     missing = []
-    if not annual_files:
-        missing.append("at least one Annual Report PDF")
-    if not investor_files:
-        missing.append("at least one Investor Presentation PDF")
+    if not annual_files and not ann_imgs:
+        missing.append("at least one Annual Report PDF or screenshot")
+    if not investor_files and not inv_imgs:
+        missing.append("at least one Investor Presentation PDF or screenshot")
     if missing:
         st.error("Please upload: " + ", ".join(missing))
         return

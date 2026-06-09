@@ -20,6 +20,10 @@ from services.reconstruction.extractor_core import (
 )
 from services.reconstruction.schema import missing_record
 from utils.constants import DOC_TYPE_ANNUAL_REPORT
+from services.llm_extractor import (
+    llm_extract_document,
+    is_groq_available,
+)
 
 logger = logging.getLogger("credit_review")
 
@@ -140,6 +144,40 @@ def extract_yearly_financials(
 
     best: dict[tuple[str, str], Any] = {}
 
+    # ── LLM extraction pass (runs first, before pdfplumber) ──────────────
+    # Groq understands any company's naming conventions natively.
+    # pdfplumber still runs after this and can override low-confidence hits.
+    groq_key = None
+    for doc in docs:
+        k = getattr(doc, "vision_api_key", None) or ""
+        # vision_api_key field is reused for groq key when set from app.py
+        if is_groq_available(k):
+            groq_key = k
+            break
+
+    if groq_key:
+        for doc in docs:
+            prepare_document(doc, "yearly")
+            llm_hits = llm_extract_document(
+                doc.pages,
+                groq_api_key=groq_key,
+                table_kind="yearly",
+                source_document=DOC_TYPE_ANNUAL_REPORT,
+                source_file=doc.filename,
+                allowed_periods=periods,
+            )
+            for hit in llm_hits:
+                key = (hit.metric, hit.period)
+                cur = best.get(key)
+                # LLM hits seed the best dict; pdfplumber can upgrade them
+                if cur is None or hit.confidence > cur.confidence:
+                    best[key] = hit
+        logger.info(
+            "[yearly] LLM pre-pass: %d values seeded into best dict",
+            sum(1 for v in best.values() if v is not None),
+        )
+    # ── end LLM pass ─────────────────────────────────────────────────────
+
     for doc in docs:
         prepare_document(doc, "yearly")
         logger.info(
@@ -257,6 +295,14 @@ def extract_yearly_financials(
                         failure_reason=FAILURE_REASON,
                     )
                 )
+
+    print("\n===== RECORDS BUILD DEBUG =====")
+    fy23 = [r for r in records if "2023" in str(r.get("period"))]
+    print(f"FY23 records in final list: {len(fy23)}")
+    for r in fy23[:3]:
+        print(f"  {r['metric']} | status={r['status']} | value={r.get('value_crore')}")
+    print(f"Periods loop used: {list(periods)}")
+    print("================================\n")
 
     # ===== DEBUG START =====
     print("\n===== ALL PERIODS IN BEST DICT =====")

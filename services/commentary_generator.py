@@ -33,6 +33,35 @@ SECTION_ORDER: tuple[tuple[str, str], ...] = (
     ("liquidity",        "Liquidity"),
 )
 
+# Values outside these bounds are extraction errors, not real figures.
+# Commentary skips the clause rather than report impossible numbers.
+_COMMENTARY_BOUNDS: dict[str, tuple[float, float]] = {
+    "Capital Adequacy Ratio":  (8.0,   50.0),
+    "Tier I Capital Ratio":    (6.0,   50.0),
+    "GNPA":   (0.0,   25.0),
+    "NNPA":   (0.0,   15.0),
+    "ROA":    (-2.0,   8.0),
+    "ROE":    (-5.0,  40.0),
+    "NII":    (1.0,   200_000.0),
+    "PAT":    (-50_000.0, 200_000.0),
+    "Total Income":  (1.0, 500_000.0),
+    "Total Assets":  (1_000.0, 5_000_000.0),
+    "Deposits":      (100.0, 5_000_000.0),
+    "Borrowings":    (100.0, 5_000_000.0),
+    "Advances":      (100.0, 5_000_000.0),
+}
+
+
+def _plausible(metric: str, value: float | None) -> bool:
+    """Return False if value is outside expected bounds — skip in commentary."""
+    if value is None:
+        return False
+    bounds = _COMMENTARY_BOUNDS.get(metric)
+    if bounds is None:
+        return True   # unknown metric — let it through
+    lo, hi = bounds
+    return lo <= value <= hi
+
 
 def _record_value_map(
     records: list[dict[str, Any]],
@@ -62,7 +91,10 @@ def _get(
     metric: str,
     period: str,
 ) -> float | None:
-    return values.get((metric, period))
+    val = values.get((metric, period))
+    if not _plausible(metric, val):
+        return None
+    return val
 
 
 def _is_stable(newer: float, older: float, tol_pct: float = 2.0) -> bool:

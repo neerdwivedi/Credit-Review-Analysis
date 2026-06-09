@@ -33,12 +33,20 @@ def check_metric_sanity(metric: str, value: float) -> list[str]:
     warnings: list[str] = []
 
     bounds: dict[str, tuple[float, float]] = {
-        "Capital Adequacy Ratio":  (0.0,  60.0),
-        "Tier I Capital Ratio":    (0.0,  60.0),
-        "ROA":                     (-5.0, 10.0),
-        "ROE":                     (-30.0, 60.0),
-        "GNPA":                    (0.0,  50.0),   # ratio in template, e.g. 1.48
-        "NNPA":                    (0.0,  30.0),   # ratio in template, e.g. 0.34
+        "Capital Adequacy Ratio":  (8.0,   45.0),
+        "Tier I Capital Ratio":    (6.0,   45.0),
+        "ROA":                     (-2.0,   8.0),
+        "ROE":                     (-5.0,  40.0),
+        "GNPA":                    (0.0,   25.0),   # above 25% = extraction error
+        "NNPA":                    (0.0,   15.0),   # above 15% = extraction error
+        "NII":                     (1.0,   500_000.0),
+        "PAT":                     (-100_000.0, 500_000.0),
+        "Total Income":            (1.0,   500_000.0),
+        "Total Assets":            (500.0, 10_000_000.0),
+        "Deposits":                (10.0,  10_000_000.0),
+        "Borrowings":              (10.0,  10_000_000.0),
+        "Advances":                (10.0,  10_000_000.0),
+        "Investments":             (1.0,   10_000_000.0),
     }
     if metric in bounds:
         lo, hi = bounds[metric]
@@ -48,8 +56,10 @@ def check_metric_sanity(metric: str, value: float) -> list[str]:
             )
 
     if metric in ("Total Assets", "Borrowings", "Investments",
-                  "Advances", "Deposits") and value < 0:
-        warnings.append(f"{metric} {value:.2f} should not be negative.")
+                  "Advances", "Deposits", "NII", "Total Income") and value < 0:
+        warnings.append(
+            f"{metric} {value:.2f} cr is negative — likely an extraction error."
+        )
 
     return warnings
 
@@ -93,15 +103,25 @@ def build_validation_warnings(
 ) -> list[str]:
     """
     Aggregate all validation warnings for human review summary.
+    Uses periods actually present in the records — not hardcoded constants —
+    so it works for any company and any FY year setting.
     """
     warnings: list[str] = []
-    allowed_periods = TABLE1_PERIODS if table_id == 1 else TABLE2_PERIODS
 
-    for period in allowed_periods:
+    # Derive periods from the records themselves
+    seen_periods: list[str] = []
+    for rec in records:
+        p = rec.get("period", "")
+        if p and p not in seen_periods:
+            seen_periods.append(p)
+    # Fall back to constants only if records are empty
+    if not seen_periods:
+        seen_periods = list(TABLE1_PERIODS if table_id == 1 else TABLE2_PERIODS)
+
+    for period in seen_periods:
         for metric in APPROVED_METRICS:
             match = [
-                r
-                for r in records
+                r for r in records
                 if r.get("metric") == metric and r.get("period") == period
             ]
             if not match:
@@ -110,21 +130,28 @@ def build_validation_warnings(
             rec = match[0]
             if rec.get("display_value") == NOT_DISCLOSED:
                 if table_id == 2:
-                    warnings.append(f"{period} not explicitly disclosed for {metric}.")
+                    warnings.append(
+                        f"{period} not explicitly disclosed for {metric}."
+                    )
                 else:
                     warnings.append(f"Missing {metric} for {period}.")
                 continue
 
             if rec.get("unit") == "unknown" and not is_ratio_metric(metric):
-                warnings.append(f"Unit not detected for {metric} ({period}).")
+                warnings.append(
+                    f"Unit not detected for {metric} ({period})."
+                )
 
             if rec.get("confidence", 0) < CONFIDENCE_WARNING_THRESHOLD:
                 warnings.append(
-                    f"Low confidence ({rec.get('confidence', 0):.2f}) for {metric} ({period})."
+                    f"Low confidence ({rec.get('confidence', 0):.2f}) "
+                    f"for {metric} ({period})."
                 )
 
             if rec.get("page_number") is None:
-                warnings.append(f"Page number missing for {metric} ({period}).")
+                warnings.append(
+                    f"Page number missing for {metric} ({period})."
+                )
 
             val = _numeric_value(rec)
             if val is not None:
