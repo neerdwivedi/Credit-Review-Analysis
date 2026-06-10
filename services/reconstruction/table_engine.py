@@ -23,7 +23,11 @@ from services.normalizer import (
 )
 from services.reconstruction.schema import ExtractionHit, TableKind, compute_confidence
 from services.reconstruction.similarity import score_row_match
-from services.validator import check_metric_sanity
+from data.metric_logic import (
+    is_value_in_range,
+    metric_requires_bs_table,
+    metric_requires_pnl_table,
+)
 
 logger = logging.getLogger("credit_review")
 
@@ -36,6 +40,11 @@ _LABEL_PREFIX = re.compile(
     r"^(?:[ivxlc]+\.|[a-z]\.|\(?\d+\)?\.|\(\d+\)|\d+\s)\s*",
     re.IGNORECASE,
 )
+
+_SKIP_HEADER_CELLS = frozenset({
+    "particulars", "schedule", "no.", "sr no", "sr", "var", "variance",
+    "change", "%", "yoy", "qoq", "growth",
+})
 
 
 def _clean_label(text: str) -> str:
@@ -65,11 +74,31 @@ def _forward_fill(row: list[str]) -> list[str]:
     return out
 
 
+_SKIP_HEADER_LABELS = frozenset({
+    "particulars", "schedule", "no.", "sr no", "sr", "var", "variance", "%",
+})
+
+
 def _period_map_from_row(
     row: list[str],
     table_kind: TableKind,
     prev_row: list[str] | None = None,
+    *,
+    h1_only: bool = False,
 ) -> dict[int, tuple[str, float]]:
+    if table_kind == "half_year" and h1_only:
+        mapping: dict[int, tuple[str, float]] = {}
+        for col_idx, cell in enumerate(row):
+            raw = str(cell or "").strip()
+            if not raw or normalize_text(raw) in _SKIP_HEADER_LABELS:
+                continue
+            if canonicalize_quarter_period(raw):
+                continue
+            period = canonicalize_table2_period(raw)
+            if period:
+                mapping[col_idx] = (period, 1.0)
+        return mapping
+
     canon = (
         canonicalize_table1_period
         if table_kind == "yearly"
@@ -79,7 +108,8 @@ def _period_map_from_row(
     ff_prev = _forward_fill(prev_row) if prev_row else None
     mapping: dict[int, tuple[str, float]] = {}
     for col_idx, cell in enumerate(ff):
-        if not cell or cell.lower() in {"particulars", "schedule", "no.", "sr no", "sr"}:
+        cell_norm = normalize_text(cell)
+        if not cell or cell_norm in _SKIP_HEADER_CELLS:
             continue
         if table_kind == "yearly":
             multi = find_all_table1_periods(cell)
@@ -90,7 +120,11 @@ def _period_map_from_row(
         if table_kind == "half_year":
             qperiod = canonicalize_quarter_period(cell)
             if qperiod:
-                mapping[col_idx] = (qperiod, 1.0)
+                mapping[col_idx] = (qperiod, 0.85)
+                continue
+            h1period = canon(cell)
+            if h1period:
+                mapping[col_idx] = (h1period, 1.0)
                 continue
         period = canon(cell)
         col_score = 1.0 if period else 0.0
@@ -124,10 +158,41 @@ def _row_looks_like_data(row: list[str]) -> bool:
     return numeric_cols >= 2
 
 
+def _column_header_verified(
+    table: list[list[Any]],
+    col_idx: int,
+    expected_period: str,
+    data_start: int,
+    *,
+    h1_only: bool,
+) -> bool:
+    """H1 extraction: column must have an explicit H1 header, not Q2/Var bleed."""
+    if not h1_only:
+        return True
+    saw_h1 = False
+    saw_quarter = False
+    for idx in range(min(data_start, 12)):
+        row = [str(c or "").strip() for c in table[idx]]
+        if col_idx >= len(row):
+            continue
+        cell = row[col_idx]
+        if not cell or normalize_text(cell) in _SKIP_HEADER_LABELS:
+            continue
+        if canonicalize_quarter_period(cell):
+            saw_quarter = True
+        if canonicalize_table2_period(cell) == expected_period:
+            saw_h1 = True
+    if saw_quarter and not saw_h1:
+        return False
+    return saw_h1
+
+
 def _detect_period_anchor(
     table: list[list[Any]],
     table_kind: TableKind,
     max_rows: int = 10,
+    *,
+    h1_only: bool = False,
 ) -> tuple[dict[int, tuple[str, float]], int]:
     """Merge period headers from all candidate header rows (supports split FY23)."""
     merged: dict[int, tuple[str, float]] = {}
@@ -139,7 +204,9 @@ def _detect_period_anchor(
             break
 
         prev = [str(c or "").strip() for c in table[idx - 1]] if idx > 0 else None
-        mapping = _period_map_from_row(row, table_kind, prev_row=prev)
+        mapping = _period_map_from_row(
+            row, table_kind, prev_row=prev, h1_only=h1_only
+        )
 
         for col_idx, val in mapping.items():
             cur = merged.get(col_idx)
@@ -152,6 +219,73 @@ def _detect_period_anchor(
         return {}, 0
     data_start = max(header_rows) + 1 if header_rows else 0
     return merged, data_start
+
+
+def _header_blob(table: list[list[Any]], max_rows: int = 8) -> str:
+    parts: list[str] = []
+    for row in table[:max_rows]:
+        parts.extend(str(c or "") for c in row)
+    return normalize_text(" ".join(parts))
+
+
+def _periods_in_col_map(
+    col_map: dict[int, tuple[str, float]],
+    allowed: set[str],
+) -> set[str]:
+    return {p for p, _ in col_map.values() if p in allowed}
+
+
+def _table_has_pnl_shape(
+    table: list[list[Any]],
+    table_kind: TableKind,
+    col_map: dict[int, tuple[str, float]],
+    allowed: set[str],
+) -> bool:
+    """P&L table: period headers + particulars-style layout."""
+    periods = _periods_in_col_map(col_map, allowed)
+    if not periods:
+        return False
+
+    header = _header_blob(table)
+    if "particulars" in header:
+        return True
+
+    if table_kind == "half_year":
+        return any(p.startswith("H1FY") for p in periods)
+
+    return len(periods) >= 2
+
+
+def _table_has_bs_shape(
+    table: list[list[Any]],
+    col_map: dict[int, tuple[str, float]],
+    allowed: set[str],
+) -> bool:
+    """Balance-sheet table: period headers + BS wording or particulars."""
+    periods = _periods_in_col_map(col_map, allowed)
+    if not periods:
+        return False
+    header = _header_blob(table)
+    if "particulars" in header:
+        return True
+    return any(
+        k in header
+        for k in ("balance sheet", "assets", "liabilities", "equity and liabilities")
+    )
+
+
+def _table_passes_shape_gate(
+    table: list[list[Any]],
+    metric: str,
+    table_kind: TableKind,
+    col_map: dict[int, tuple[str, float]],
+    allowed: set[str],
+) -> bool:
+    if metric_requires_pnl_table(metric, table_kind):
+        return _table_has_pnl_shape(table, table_kind, col_map, allowed)
+    if metric_requires_bs_table(metric, table_kind):
+        return _table_has_bs_shape(table, col_map, allowed)
+    return True
 
 
 def _table_quality_score(table: list[list[Any]], table_kind: TableKind) -> float:
@@ -226,6 +360,7 @@ def extract_metric_from_tables(
     source_section: str,
     preferred_source: bool,
     standalone_section: bool,
+    h1_only: bool = False,
 ) -> dict[str, ExtractionHit]:
     """Scan all tables on a page for one metric; return best hit per period."""
     found: dict[str, ExtractionHit] = {}
@@ -240,7 +375,9 @@ def extract_metric_from_tables(
     for table in sorted_tables:
         if not table or len(table) < 2:
             continue
-        col_map, data_start = _detect_period_anchor(table, table_kind)
+        col_map, data_start = _detect_period_anchor(
+            table, table_kind, h1_only=h1_only
+        )
         if not col_map:
             continue
         period_cols = {
@@ -249,6 +386,11 @@ def extract_metric_from_tables(
             if p in allowed
         }
         if not period_cols:
+            continue
+
+        if not _table_passes_shape_gate(
+            table, metric, table_kind, col_map, allowed
+        ):
             continue
 
         unit = _detect_unit_in_table(table, page_unit)
@@ -265,15 +407,22 @@ def extract_metric_from_tables(
             for col_idx, (period, col_score) in period_cols.items():
                 if col_idx >= len(row):
                     continue
+                if table_kind == "half_year" and not period.startswith("H1FY"):
+                    continue
+                if not _column_header_verified(
+                    table,
+                    col_idx,
+                    period,
+                    data_start,
+                    h1_only=h1_only,
+                ):
+                    continue
                 raw_cell = row[col_idx]
                 raw_text = str(raw_cell or "").strip()
                 parsed = parse_numeric_value(raw_text)
                 if parsed is None:
                     continue
-                # Reject only whole-number integers under 20 — these are
-                # schedule reference numbers or page numbers (e.g. Note 4,
-                # page 12). Do NOT reject values >= 20: small but real
-                # financial figures can legitimately be under 50 cr.
+                # Reject schedule reference integers under 20 (Note 4, page 12).
                 if (
                     parsed is not None
                     and not is_ratio_metric(metric)
@@ -284,9 +433,16 @@ def extract_metric_from_tables(
                 ):
                     continue
                 if is_ratio_metric(metric) and (
-                    parsed > 100 or (1900 <= abs(parsed) <= 2035)
+                    parsed > 100 or (1900 <= abs(parsed) <= 2039)
                 ):
                     continue
+                if is_ratio_metric(metric) and metric in ("GNPA", "NNPA"):
+                    if abs(parsed) > 30 and "%" not in raw_text:
+                        continue
+                if is_ratio_metric(metric) and "%" not in raw_text:
+                    bounds = (5.0, 50.0) if "capital" in metric.lower() else (0.0, 40.0)
+                    if abs(parsed) > bounds[1]:
+                        continue
 
                 if is_ratio_metric(metric):
                     value_crore = parsed
@@ -301,7 +457,7 @@ def extract_metric_from_tables(
                     value_crore = converted
 
                 sanity_val = value_crore if not is_ratio_metric(metric) else parsed
-                if check_metric_sanity(metric, float(sanity_val)):
+                if not is_value_in_range(metric, float(sanity_val)):
                     continue
 
                 conf = compute_confidence(

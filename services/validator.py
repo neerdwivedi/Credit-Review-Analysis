@@ -14,6 +14,7 @@ from data.metric_aliases import (
     TABLE1_PERIODS,
     TABLE2_PERIODS,
 )
+from data.metric_logic import get_valid_range, is_value_in_range
 from services.normalizer import is_ratio_metric
 
 CONFIDENCE_WARNING_THRESHOLD = 0.60
@@ -32,25 +33,10 @@ def _numeric_value(record: dict[str, Any]) -> float | None:
 def check_metric_sanity(metric: str, value: float) -> list[str]:
     warnings: list[str] = []
 
-    bounds: dict[str, tuple[float, float]] = {
-        "Capital Adequacy Ratio":  (8.0,   45.0),
-        "Tier I Capital Ratio":    (6.0,   45.0),
-        "ROA":                     (-2.0,   8.0),
-        "ROE":                     (-5.0,  40.0),
-        "GNPA":                    (0.0,   25.0),   # above 25% = extraction error
-        "NNPA":                    (0.0,   15.0),   # above 15% = extraction error
-        "NII":                     (1.0,   500_000.0),
-        "PAT":                     (-100_000.0, 500_000.0),
-        "Total Income":            (1.0,   500_000.0),
-        "Total Assets":            (500.0, 10_000_000.0),
-        "Deposits":                (10.0,  10_000_000.0),
-        "Borrowings":              (10.0,  10_000_000.0),
-        "Advances":                (10.0,  10_000_000.0),
-        "Investments":             (1.0,   10_000_000.0),
-    }
-    if metric in bounds:
-        lo, hi = bounds[metric]
-        if not (lo <= value <= hi):
+    if not is_value_in_range(metric, value):
+        bounds = get_valid_range(metric)
+        if bounds:
+            lo, hi = bounds
             warnings.append(
                 f"{metric} value {value:.2f} is outside expected range {lo}–{hi}."
             )

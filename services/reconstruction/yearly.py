@@ -40,6 +40,13 @@ def _preferred_fy_for_period(period: str) -> int | None:
     return None
 
 
+def _ensure_docs_indexed(docs: list[DocumentContext]) -> None:
+    """Build page indexes before sorting — fy_hint lives on DocumentContext."""
+    for doc in docs:
+        if not doc.norm_text_by_page:
+            doc.build_indexes()
+
+
 def _sort_annual_docs(docs: list[DocumentContext]) -> list[DocumentContext]:
     return sorted(
         docs,
@@ -54,28 +61,32 @@ def _should_prefer_hit(
     period: str,
     doc_fy: int | None,
 ) -> bool:
+    from data.metric_logic import is_obvious_schedule_noise, score_yearly_extraction_hit
+
+    if is_obvious_schedule_noise(new_hit.metric, new_hit):
+        return False
+    if getattr(new_hit, "source_section", "") == "text_regex":
+        return False
     if current is None:
         return True
+    if is_obvious_schedule_noise(current.metric, current):
+        return True
 
-    preferred_fy = _preferred_fy_for_period(period)
-
-    # Prefer hit from the correct source document
-    if doc_fy and preferred_fy:
-        cur_fy = _fy_from_filename(
-            getattr(current, "source_file", "") or ""
-        )
-        # New hit is from preferred source, current is not
-        if doc_fy == preferred_fy and cur_fy != preferred_fy:
-            return True
-        # New hit is from worse source than current
-        if cur_fy == preferred_fy and doc_fy != preferred_fy:
-            return False
-
-    # Standard confidence comparison
+    preferred_fy = _preferred_fy_for_period(period) or doc_fy
+    new_score = score_yearly_extraction_hit(
+        new_hit, period=period, preferred_doc_fy=preferred_fy
+    )
+    cur_score = score_yearly_extraction_hit(
+        current, period=period, preferred_doc_fy=preferred_fy
+    )
+    if new_score > cur_score + 0.03:
+        return True
     if new_hit.confidence > current.confidence + 0.05:
         return True
-    if new_hit.confidence >= current.confidence and new_hit.standalone_section:
-        return not current.standalone_section
+    if new_hit.standalone_section and not current.standalone_section:
+        return True
+    if new_hit.from_table and not current.from_table:
+        return True
     return False
 
 
@@ -97,11 +108,19 @@ def _doc_order_for_period(
     docs: list[DocumentContext],
     period: str,
 ) -> list[DocumentContext]:
+    import re
+
     preferred_fy = _preferred_fy_for_period(period)
-    primary = [d for d in docs if d.fiscal_year_hint == preferred_fy]
+    m = re.search(r"(20\d{2})$", period)
+    period_year = int(m.group(1)) if m else None
+    preferred_hints = {
+        y for y in (preferred_fy, period_year, (period_year + 1) if period_year else None)
+        if y
+    }
+    primary = [d for d in docs if d.fiscal_year_hint in preferred_hints]
     secondary = [
         d for d in docs
-        if d.fiscal_year_hint and d.fiscal_year_hint != preferred_fy
+        if d.fiscal_year_hint and d.fiscal_year_hint not in preferred_hints
     ]
     rest = [d for d in docs if not d.fiscal_year_hint]
     return (
@@ -126,7 +145,9 @@ def extract_yearly_financials(
 
     t0 = time.perf_counter()
     records: list[dict[str, Any]] = []
-    docs = _sort_annual_docs(annual_reports)
+    docs = list(annual_reports)
+    _ensure_docs_indexed(docs)
+    docs = _sort_annual_docs(docs)
 
     if not docs:
         for metric in APPROVED_METRICS:
@@ -144,68 +165,147 @@ def extract_yearly_financials(
 
     best: dict[tuple[str, str], Any] = {}
 
-    # ── LLM extraction pass (runs first, before pdfplumber) ──────────────
-    # Groq understands any company's naming conventions natively.
-    # pdfplumber still runs after this and can override low-confidence hits.
     groq_key = None
     for doc in docs:
         k = getattr(doc, "vision_api_key", None) or ""
-        # vision_api_key field is reused for groq key when set from app.py
         if is_groq_available(k):
             groq_key = k
             break
 
-    if groq_key:
-        for doc in docs:
-            prepare_document(doc, "yearly")
-            llm_hits = llm_extract_document(
-                doc.pages,
-                groq_api_key=groq_key,
-                table_kind="yearly",
-                source_document=DOC_TYPE_ANNUAL_REPORT,
-                source_file=doc.filename,
-                allowed_periods=periods,
-            )
-            for hit in llm_hits:
-                key = (hit.metric, hit.period)
-                cur = best.get(key)
-                # LLM hits seed the best dict; pdfplumber can upgrade them
-                if cur is None or hit.confidence > cur.confidence:
-                    best[key] = hit
-        logger.info(
-            "[yearly] LLM pre-pass: %d values seeded into best dict",
-            sum(1 for v in best.values() if v is not None),
-        )
-    # ── end LLM pass ─────────────────────────────────────────────────────
-
-    for doc in docs:
-        prepare_document(doc, "yearly")
-        logger.info(
-            "[yearly] Processing %s (fy_hint=%s, standalone_pages=%d)",
-            doc.filename,
-            doc.fiscal_year_hint,
-            len(doc.standalone_pages),
-        )
-        try:
-            with pdfplumber.open(io.BytesIO(doc.pdf_bytes)) as pdf:
-                for metric in APPROVED_METRICS:
-                    hits = extract_metric_on_document(
-                        doc,
-                        pdf,
-                        metric=metric,
-                        periods=periods,
-                        table_kind="yearly",
-                        source_document=DOC_TYPE_ANNUAL_REPORT,
-                    )
-                    for period, hit in hits.items():
+    for metric in APPROVED_METRICS:
+        for period in periods:
+            ordered_docs = _doc_order_for_period(docs, period)
+            for doc in ordered_docs:
+                prepare_document(doc, "yearly")
+                try:
+                    with pdfplumber.open(io.BytesIO(doc.pdf_bytes)) as pdf:
+                        hits = extract_metric_on_document(
+                            doc,
+                            pdf,
+                            metric=metric,
+                            periods=(period,),
+                            table_kind="yearly",
+                            source_document=DOC_TYPE_ANNUAL_REPORT,
+                        )
+                        hit = hits.get(period)
+                        if hit is None:
+                            continue
                         key = (metric, period)
                         cur = best.get(key)
                         if _should_prefer_hit(
                             cur, hit, period, doc.fiscal_year_hint
                         ):
                             best[key] = hit
+                except Exception as exc:
+                    logger.exception(
+                        "[yearly] Failed %s %s on %s: %s",
+                        metric,
+                        period,
+                        doc.filename,
+                        exc,
+                    )
+
+    if docs:
+        logger.info(
+            "[yearly] Processed %d annual report(s), fy_hints=%s",
+            len(docs),
+            [d.fiscal_year_hint for d in docs],
+        )
+
+    from data.metric_logic import (
+        DERIVATION_COMPONENT_NAMES,
+        apply_yearly_derived_values,
+        filter_duplicate_cross_period_hits,
+        filter_invalid_hits,
+        filter_obvious_schedule_noise,
+        filter_untrusted_source_hits,
+        merge_component_hits,
+        resolve_yearly_value_collisions,
+    )
+
+    components_best: dict[tuple[str, str], Any] = {}
+    for doc in docs:
+        try:
+            with pdfplumber.open(io.BytesIO(doc.pdf_bytes)) as pdf:
+                for component in DERIVATION_COMPONENT_NAMES:
+                    hits = extract_metric_on_document(
+                        doc,
+                        pdf,
+                        metric=component,
+                        periods=periods,
+                        table_kind="yearly",
+                        source_document=DOC_TYPE_ANNUAL_REPORT,
+                    )
+                    merge_component_hits(components_best, hits, component)
         except Exception as exc:
-            logger.exception("[yearly] Failed on %s: %s", doc.filename, exc)
+            logger.warning(
+                "[yearly] Component extraction failed on %s: %s",
+                doc.filename,
+                exc,
+            )
+
+    untrusted = filter_untrusted_source_hits(best)
+    if untrusted:
+        logger.info("[yearly] Dropped %d untrusted source hits", untrusted)
+    dupes = filter_duplicate_cross_period_hits(best)
+    if dupes:
+        logger.info("[yearly] Dropped %d duplicate cross-period hits", dupes)
+    noise = filter_obvious_schedule_noise(best)
+    if noise:
+        logger.info("[yearly] Dropped %d obvious schedule-note hits", noise)
+    collisions = resolve_yearly_value_collisions(best)
+    if collisions:
+        logger.info("[yearly] Resolved %d duplicate page/value collisions", collisions)
+    removed = filter_invalid_hits(best)
+    if removed:
+        logger.info("[yearly] Dropped %d sanity-failed hits", removed)
+
+    company_type = getattr(docs[0], "company_type", "nbfc") if docs else "nbfc"
+    apply_yearly_derived_values(
+        best,
+        periods,
+        components_best=components_best,
+        company_type=company_type,
+        source_file=docs[0].filename if docs else "",
+        source_document=DOC_TYPE_ANNUAL_REPORT,
+    )
+
+    if groq_key:
+        missing_keys = {
+            (metric, period)
+            for metric in APPROVED_METRICS
+            for period in periods
+            if not best.get((metric, period))
+        }
+        if missing_keys:
+            missing_metrics = tuple(dict.fromkeys(m for m, _ in missing_keys))
+            llm_filled = 0
+            for doc in docs:
+                prepare_document(doc, "yearly")
+                llm_hits = llm_extract_document(
+                    doc.pages,
+                    groq_api_key=groq_key,
+                    table_kind="yearly",
+                    source_document=DOC_TYPE_ANNUAL_REPORT,
+                    source_file=doc.filename,
+                    allowed_periods=periods,
+                    metrics_filter=missing_metrics,
+                    only_missing_keys=missing_keys,
+                )
+                for hit in llm_hits:
+                    key = (hit.metric, hit.period)
+                    if key in missing_keys and not best.get(key):
+                        best[key] = hit
+                        missing_keys.discard(key)
+                        llm_filled += 1
+            logger.info(
+                "[yearly] LLM fill-missing: %d values added (%d still missing)",
+                llm_filled,
+                len(missing_keys),
+            )
+        filter_obvious_schedule_noise(best)
+        resolve_yearly_value_collisions(best)
+        filter_invalid_hits(best)
 
     # Single Gemini vision call for ALL missing yearly metrics
     vision_key = None
@@ -296,85 +396,22 @@ def extract_yearly_financials(
                     )
                 )
 
-    print("\n===== RECORDS BUILD DEBUG =====")
-    fy23 = [r for r in records if "2023" in str(r.get("period"))]
-    print(f"FY23 records in final list: {len(fy23)}")
-    for r in fy23[:3]:
-        print(f"  {r['metric']} | status={r['status']} | value={r.get('value_crore')}")
-    print(f"Periods loop used: {list(periods)}")
-    print("================================\n")
-
-    # ===== DEBUG START =====
-    print("\n===== ALL PERIODS IN BEST DICT =====")
-    all_periods_found = sorted(set(p for _, p in best.keys()))
-    for p in all_periods_found:
-        print(repr(p))
-
-    print("\n===== ALL FY23 HITS =====")
-    found_any = False
-    for (metric, period), hit in best.items():
-        if "2023" in str(period) or "23" in str(period).lower():
-            print(
-                f"metric={metric} | "
-                f"period={repr(period)} | "
-                f"value={hit.value_crore} | "
-                f"source={hit.source_file}"
-            )
-            found_any = True
-    if not found_any:
-        print("NO FY23 HITS FOUND AT ALL")
-    print("=====================================\n")
-    # ===== DEBUG END =====
-
-    # Calculate NII = Interest Earned - Interest Expended
-    # for banks where NII is not a direct line item
-    interest_earned = {}
-    interest_expended = {}
-
-    for rec in records:
-        if rec.get("status") == "extracted":
-            metric = rec.get("metric", "")
-            period = rec.get("period", "")
-            val = rec.get("value_crore")
-            if metric == "Interest Earned" and val:
-                interest_earned[period] = float(val)
-            elif metric == "Interest Expended" and val:
-                interest_expended[period] = float(val)
-
-    # Replace missing NII records with calculated values
-    for i, rec in enumerate(records):
-        if rec.get("metric") == "NII" and rec.get("status") == "missing":
-            period = rec.get("period", "")
-            earned = interest_earned.get(period)
-            expended = interest_expended.get(period)
-            if earned is not None and expended is not None:
-                nii_val = earned - expended
-                from services.normalizer import format_crore_display
-                records[i] = {
-                    **rec,
-                    "value_crore": nii_val,
-                    "approved_value": nii_val,
-                    "display_value": format_crore_display(nii_val),
-                    "status": "extracted",
-                    "source_section": "calculated_interest_earned_minus_expended",
-                    "confidence": 0.90,
-                    "failure_reason": None,
-                    "notes": (
-                        f"NII calculated: Interest Earned "
-                        f"({format_crore_display(earned)}) - "
-                        f"Interest Expended "
-                        f"({format_crore_display(expended)})"
-                    ),
-                }
-                logger.info(
-                    "[yearly] NII calculated for %s: %s cr",
-                    period, format_crore_display(nii_val),
-                )
+    extracted = sum(1 for r in records if r["status"] == "extracted")
+    missing_metrics = [
+        m
+        for m in APPROVED_METRICS
+        if not any(best.get((m, p)) for p in periods)
+    ]
+    if missing_metrics:
+        logger.info(
+            "[yearly] Still missing metrics: %s",
+            ", ".join(missing_metrics),
+        )
 
     logger.info(
         "[yearly] Complete in %.2fs — %d records, %d extracted",
         time.perf_counter() - t0,
         len(records),
-        sum(1 for r in records if r["status"] == "extracted"),
+        extracted,
     )
     return records

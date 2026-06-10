@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from data.metric_aliases import METRIC_ALIASES
+from data.metric_logic import aliases_for_metric
 from services.reconstruction.document import DocumentContext
 from services.reconstruction.similarity import compact
 
@@ -63,12 +64,13 @@ SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "key balance sheet",
         "balance sheet highlights",
     ),
+    "pnl_statement_table": (),  # filled by content detection in detect_sections
 }
 
 YEARLY_METRIC_SECTIONS: dict[str, tuple[str, ...]] = {
-    "Total Income": ("standalone_pnl", "standalone_results", "five_year_highlights", "financial_highlights"),
-    "NII": ("standalone_pnl", "standalone_results", "five_year_highlights", "financial_highlights"),
-    "PAT": ("standalone_pnl", "standalone_results", "five_year_highlights", "financial_highlights"),
+    "Total Income": ("pnl_statement_table", "standalone_pnl", "standalone_results", "five_year_highlights"),
+    "NII": ("pnl_statement_table", "standalone_pnl", "standalone_results", "five_year_highlights"),
+    "PAT": ("pnl_statement_table", "standalone_pnl", "standalone_results", "five_year_highlights"),
     "Total Assets": ("standalone_bs", "standalone_results", "five_year_highlights", "financial_highlights"),
     "Borrowings": ("standalone_bs", "standalone_results", "five_year_highlights"),
     "Investments": ("standalone_bs", "standalone_results", "five_year_highlights"),
@@ -81,9 +83,9 @@ YEARLY_METRIC_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 HALF_YEAR_METRIC_SECTIONS: dict[str, tuple[str, ...]] = {
-    "Total Income": ("h1_pnl", "h1_highlights", "h1_section"),
-    "NII": ("h1_pnl", "h1_highlights", "h1_section"),
-    "PAT": ("h1_pnl", "h1_highlights", "h1_section"),
+    "Total Income": ("pnl_statement_table", "h1_pnl", "h1_section", "h1_highlights"),
+    "NII": ("pnl_statement_table", "h1_pnl", "h1_section", "h1_highlights"),
+    "PAT": ("pnl_statement_table", "h1_pnl", "h1_section", "h1_highlights"),
     "ROE": ("h1_highlights", "h1_section", "h1_pnl", "ratios"),
     "ROA": ("h1_highlights", "h1_section", "ratios", "financial_highlights"),
     "Total Assets": ("h1_highlights", "h1_section", "h1_pnl", "financial_highlights"),
@@ -110,6 +112,67 @@ NEIGHBOR_RADIUS = 2
 PER_SECTION_CAP = 20
 
 
+def _detect_pnl_statement_table_pages(
+    ctx: DocumentContext,
+    table_kind: str,
+) -> list[int]:
+    """
+    Content-based P&L table pages (no fixed page numbers).
+
+    Yearly: Particulars + 2+ year-end date columns (31.03.20xx).
+    Half-year: P&L wording + H1 / half-year period markers.
+    """
+    import re
+
+    anchor: set[int] = set()
+    for page_num, norm in ctx.norm_text_by_page.items():
+        raw = ctx.text_by_page.get(page_num, "")
+        if table_kind == "yearly":
+            dates = set(re.findall(r"31\.03\.20\d{2}", raw))
+            has_particulars = "particulars" in norm
+            has_pnl = any(
+                k in norm
+                for k in (
+                    "statement of profit",
+                    "profit and loss",
+                    "profit & loss",
+                    "standalone financial results",
+                )
+            )
+            if has_particulars and len(dates) >= 2:
+                anchor.add(page_num)
+            elif has_pnl and len(dates) >= 2:
+                anchor.add(page_num)
+        else:
+            compact = re.sub(r"\s+", "", norm)
+            has_h1 = bool(re.search(r"h1fy\d{2}", compact)) or "half year" in norm
+            has_pnl = any(
+                k in norm
+                for k in (
+                    "profit and loss",
+                    "profit & loss",
+                    "statement of profit",
+                    "particulars",
+                    "financial performance",
+                )
+            )
+            if has_pnl and has_h1:
+                anchor.add(page_num)
+
+    if not anchor:
+        return []
+
+    max_page = max(ctx.text_by_page.keys()) if ctx.text_by_page else 0
+    expanded: set[int] = set()
+    for page_num in anchor:
+        expanded.add(page_num)
+        for delta in (-1, 1):
+            neighbor = page_num + delta
+            if 1 <= neighbor <= max_page:
+                expanded.add(neighbor)
+    return sorted(expanded)
+
+
 def detect_sections(ctx: DocumentContext, table_kind: str) -> None:
     max_page = max(ctx.text_by_page.keys()) if ctx.text_by_page else 0
     ctx.section_pages = {}
@@ -133,14 +196,20 @@ def detect_sections(ctx: DocumentContext, table_kind: str) -> None:
                 if 1 <= np <= max_page:
                     expanded.add(np)
 
-        if ctx.table_count_by_page:
+        # Keep standalone section neighbours even when table preview missed a page.
+        critical = section.startswith("standalone_")
+        if ctx.table_count_by_page and not critical:
             expanded = {p for p in expanded if ctx.table_count_by_page.get(p, 0) > 0}
 
         ctx.section_pages[section] = sorted(expanded)
 
+    ctx.section_pages["pnl_statement_table"] = _detect_pnl_statement_table_pages(
+        ctx, table_kind
+    )
+
 
 def _metric_aliases_compact(metric: str) -> list[str]:
-    return [compact(a) for a in METRIC_ALIASES.get(metric, [])]
+    return [compact(a) for a in aliases_for_metric(metric, METRIC_ALIASES)]
 
 
 def score_page_for_metric(
@@ -225,7 +294,24 @@ def select_candidate_pages(
                 selected.append(p)
                 selected_set.add(p)
 
-    return sorted(selected)[:max_pages]
+    if table_kind == "yearly":
+        for section in (
+            "pnl_statement_table",
+            "standalone_pnl",
+            "standalone_bs",
+            "standalone_results",
+        ):
+            for p in ctx.section_pages.get(section, []):
+                if p not in selected_set:
+                    selected.insert(0, p)
+                    selected_set.add(p)
+    elif table_kind == "half_year":
+        for p in ctx.section_pages.get("pnl_statement_table", []):
+            if p not in selected_set:
+                selected.insert(0, p)
+                selected_set.add(p)
+
+    return selected[:max_pages]
 
 
 def priority_sections_for(metric: str, table_kind: str) -> tuple[str, ...]:

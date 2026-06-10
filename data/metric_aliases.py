@@ -130,8 +130,9 @@ TABLE1_PERIOD_ALIASES: dict[str, str] = {
 
 TABLE2_PERIOD_ALIASES: dict[str, str] = {
     "h1fy26": "H1FY26", "h1 fy26": "H1FY26", "h1 fy 26": "H1FY26",
+    "h1 fy'26": "H1FY26",
     "half year fy26": "H1FY26", "half-year fy26": "H1FY26",
-    "h1 fy25": "H1FY25", "h1fy25": "H1FY25",
+    "h1 fy25": "H1FY25", "h1fy25": "H1FY25", "h1 fy 25": "H1FY25",
     "half year fy25": "H1FY25",
     "sep 2025 half year": "H1FY26",
     "half year ended sep 2025": "H1FY26",
@@ -153,6 +154,8 @@ TABLE2_REJECT_PATTERNS: tuple[str, ...] = (
 METRIC_ALIASES: dict[str, list[str]] = {
     "Total Income": [
         "Total Income", "Net Total Income", "Total Net Income",
+        "Revenue from Operations", "Revenue From Operations",
+        "Total Revenue from Operations",
     ],
     "NII": [
         "NII",
@@ -165,7 +168,9 @@ METRIC_ALIASES: dict[str, list[str]] = {
         "Profit for the year", "Net profit for the year",
         "Profit/(Loss) for the year", "Profit after tax (PAT)",
         "Net Profit After Tax",
+        "Profit after tax", "Profit After Tax (PAT)",
         "PAT (₹ Cr)", "PAT (Rs Cr)", "PAT (Rs. Cr)",
+        "Profit for the period", "Net profit for the period",
     ],
     "Total Assets": [
         "Total Assets", "Balance Sheet Size", "Total Balance Sheet",

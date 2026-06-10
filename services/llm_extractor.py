@@ -23,7 +23,12 @@ from services.reconstruction.schema import ExtractionHit, TableKind
 logger = logging.getLogger("credit_review")
 
 GROQ_MODEL = "llama-3.1-8b-instant"
-LLM_CONFIDENCE = 0.72
+LLM_CONFIDENCE = 0.58
+
+# Values copied from old prompt examples — reject if LLM echoes them.
+_PROMPT_ECHO_VALUES: frozenset[float] = frozenset({
+    1234.5, 5678.0, 12345.0, 2345.0, 6789.0, 67890.0, 4125.0,
+})
 
 _EXTRACTION_PROMPT = """You are a financial data extraction specialist for Indian banks and NBFCs.
 You will receive text extracted from an annual report or investor presentation PDF.
@@ -36,19 +41,17 @@ Target periods for this document (use EXACT period labels as shown below):
 
 Rules:
 1. Return ONLY valid JSON — no markdown, no explanation
-2. Use numbers exactly as shown; convert ALL currency amounts to Rs crore
+2. Use numbers exactly as they appear in the text; convert ALL currency amounts to Rs crore
 3. Ratios (CAR, Tier I, GNPA, NNPA, ROA, ROE) stay as percentages
-4. If a metric/period is not found, omit it — do not guess
+4. If a metric/period is not found in the text, omit it entirely — never guess
 5. For yearly docs use periods like "31.03.2025"
 6. For half-year docs use periods like "H1FY26", "H1FY25"
+7. NEVER invent numbers. Every value must be traceable to the document text below.
 
-Return this JSON structure:
+Return this JSON structure (use an empty "metrics" object when nothing is found):
 {{
   "unit_detected": "crore|lakh|thousand|unknown",
-  "metrics": {{
-    "PAT": {{"31.03.2025": 1234.5}},
-    "NII": {{"H1FY26": 5678.0}}
-  }}
+  "metrics": {{}}
 }}
 
 Document text:
@@ -121,6 +124,39 @@ def _call_groq(prompt: str, api_key: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+def _value_appears_in_text(value: float, text: str) -> bool:
+    """Reject LLM hallucinations — number must appear on the source page."""
+    compact = text.replace(",", "").replace(" ", "")
+    if not compact:
+        return False
+    candidates: list[str] = []
+    if value == int(value):
+        candidates.append(str(int(value)))
+    candidates.append(f"{value:.2f}".rstrip("0").rstrip("."))
+    candidates.append(f"{value:.1f}".rstrip("0").rstrip("."))
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        if cand in compact:
+            return True
+    return False
+
+
+def _reject_llm_value(metric: str, value: float, page_text: str) -> bool:
+    """True if this LLM value should be discarded."""
+    from data.metric_logic import is_value_in_range
+
+    if value in _PROMPT_ECHO_VALUES:
+        return True
+    if not is_value_in_range(metric, value):
+        return True
+    if not _value_appears_in_text(value, page_text):
+        return True
+    return False
+
+
 def _parse_json_response(raw: str) -> dict[str, Any] | None:
     text = re.sub(r"```json\s*", "", raw)
     text = re.sub(r"```\s*", "", text).strip()
@@ -139,8 +175,10 @@ def llm_extract_document(
     source_document: str,
     source_file: str,
     allowed_periods: tuple[str, ...],
+    metrics_filter: tuple[str, ...] | None = None,
+    only_missing_keys: set[tuple[str, str]] | None = None,
 ) -> list[ExtractionHit]:
-    """Extract metrics from page text via Groq; returns ExtractionHit list."""
+    """Extract metrics from page text via Groq; returns validated ExtractionHit list."""
     if not pages or not groq_api_key:
         return []
 
@@ -148,23 +186,20 @@ def llm_extract_document(
     if not target_pages:
         return []
 
-    # One page at a time to stay under 6000 TPM
-    batches = [[p] for p in target_pages]
-
+    metrics_list = metrics_filter or APPROVED_METRICS
     allowed_set = set(allowed_periods)
-    hits: list[ExtractionHit] = []
+    best_by_key: dict[tuple[str, str], ExtractionHit] = {}
 
-    for batch in batches:
-        page_item = batch[0]
+    for page_item in target_pages:
         page_text = (page_item.get("text") or "").strip()
         if not page_text:
             continue
         page_text_trimmed = page_text[:2500]
-        page_num = page_item.get("page", "?")
+        page_num = int(page_item.get("page", 0) or 0)
         cluster_text = f"\n--- Page {page_num} ---\n{page_text_trimmed}\n"
 
         prompt = _EXTRACTION_PROMPT.format(
-            metrics=", ".join(APPROVED_METRICS),
+            metrics=", ".join(metrics_list),
             periods=", ".join(allowed_periods),
             text=cluster_text,
         )
@@ -186,6 +221,8 @@ def llm_extract_document(
         for metric, period_values in metrics_data.items():
             if metric not in APPROVED_METRICS:
                 continue
+            if metrics_filter and metric not in metrics_filter:
+                continue
             if not isinstance(period_values, dict):
                 continue
             for period_raw, value in period_values.items():
@@ -194,33 +231,41 @@ def llm_extract_document(
                 period = _canonicalize_period(str(period_raw), table_kind) or str(period_raw)
                 if period not in allowed_set:
                     continue
+                key = (metric, period)
+                if only_missing_keys is not None and key not in only_missing_keys:
+                    continue
                 try:
                     val = float(value)
                 except (TypeError, ValueError):
                     continue
-                unit = "percent" if is_ratio_metric(metric) else "crore"
-                page_num = int(batch[0].get("page", 0) or 0)
-                hits.append(
-                    ExtractionHit(
-                        table=table_kind,
-                        metric=metric,
-                        period=period,
-                        value_original=val,
-                        unit=unit,
-                        value_crore=val,
-                        page_number=page_num,
-                        source_document=source_document,
-                        source_file=source_file,
-                        source_section="groq_llm",
-                        confidence=LLM_CONFIDENCE,
-                        row_label=metric,
-                        from_table=False,
-                        used_text_fallback=True,
+                if _reject_llm_value(metric, val, page_text):
+                    logger.info(
+                        "[llm_extractor] rejected %s | %s %s = %s (not in page text)",
+                        source_file, metric, period, val,
                     )
+                    continue
+                unit = "percent" if is_ratio_metric(metric) else "crore"
+                hit = ExtractionHit(
+                    table=table_kind,
+                    metric=metric,
+                    period=period,
+                    value_original=val,
+                    unit=unit,
+                    value_crore=val,
+                    page_number=page_num,
+                    source_document=source_document,
+                    source_file=source_file,
+                    source_section="groq_llm",
+                    confidence=LLM_CONFIDENCE,
+                    row_label=metric,
+                    from_table=False,
+                    used_text_fallback=True,
                 )
+                if key not in best_by_key:
+                    best_by_key[key] = hit
                 logger.info(
-                    "[llm_extractor] %s | %s %s = %s",
-                    source_file, metric, period, val,
+                    "[llm_extractor] %s | %s %s = %s (page %d)",
+                    source_file, metric, period, val, page_num,
                 )
 
-    return hits
+    return list(best_by_key.values())

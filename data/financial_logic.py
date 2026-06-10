@@ -26,14 +26,26 @@ METRIC_TYPE = {
     "ROE": MetricType.DERIVED,
     "Interest Earned": MetricType.FLOW,
     "Interest Expended": MetricType.FLOW,
+    # Derivation-only P&L components (Q1+Q2 for H1)
+    "Revenue from Operations": MetricType.FLOW,
+    "Profit Before Tax": MetricType.FLOW,
+    "Tax": MetricType.FLOW,
+    "Current Tax": MetricType.FLOW,
+    "Deferred Tax": MetricType.FLOW,
 }
 
 def aggregate_h1(metric, q1, q2):
+    """
+    Build H1 from quarters.
+
+    Flow metrics (PAT, Total Income, …) require BOTH quarters — a single Q2
+    value is not cumulative H1. Snapshot/ratio metrics use Q2 (period-end).
+    """
     mtype = METRIC_TYPE.get(metric)
     if mtype == MetricType.FLOW:
         if q1 is not None and q2 is not None:
             return q1 + q2
-        return q2 if q2 is not None else q1
+        return None
     if mtype in (MetricType.SNAPSHOT, MetricType.RATIO):
         return q2
     return None
@@ -64,6 +76,50 @@ def derive_h1_values(q1_values, q2_values):
         "confidence": 0.9 if nii is not None else 0.0,
         "needs_review": nii is None,
     }
+    pat_info = results.get("PAT", {})
+    pat = pat_info.get("value")
+    if pat is None or pat_info.get("needs_review"):
+        pbt = aggregate_h1(
+            "Profit Before Tax",
+            q1_values.get("Profit Before Tax"),
+            q2_values.get("Profit Before Tax"),
+        )
+        tax_q = aggregate_h1("Tax", q1_values.get("Tax"), q2_values.get("Tax"))
+        tax_cur = aggregate_h1(
+            "Current Tax", q1_values.get("Current Tax"), q2_values.get("Current Tax")
+        )
+        tax_def = aggregate_h1(
+            "Deferred Tax", q1_values.get("Deferred Tax"), q2_values.get("Deferred Tax")
+        )
+        tax = tax_q
+        if tax is None and tax_cur is not None and tax_def is not None:
+            tax = tax_cur + tax_def
+        elif tax is None:
+            tax = tax_cur if tax_cur is not None else tax_def
+        if pbt is not None and tax is not None:
+            pat = pbt - tax
+            results["PAT"] = {
+                "value": pat,
+                "method": "PBT-Tax",
+                "confidence": 0.9,
+                "needs_review": False,
+            }
+
+    ti_info = results.get("Total Income", {})
+    ti = ti_info.get("value")
+    if ti is None or ti_info.get("needs_review"):
+        rev = aggregate_h1(
+            "Revenue from Operations",
+            q1_values.get("Revenue from Operations"),
+            q2_values.get("Revenue from Operations"),
+        )
+        if rev is not None:
+            results["Total Income"] = {
+                "value": rev,
+                "method": "RevenueFromOps",
+                "confidence": 0.9,
+                "needs_review": False,
+            }
     pat = results.get("PAT", {}).get("value")
     a1 = q1_values.get("Total Assets")
     a2 = q2_values.get("Total Assets")

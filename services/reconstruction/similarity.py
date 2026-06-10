@@ -6,6 +6,7 @@ import re
 from difflib import SequenceMatcher
 
 from data.metric_aliases import METRIC_ALIASES
+from data.metric_logic import aliases_for_metric
 from data.metric_exclusions import METRIC_ROW_EXCLUSIONS
 from services.normalizer import normalize_text
 
@@ -41,13 +42,19 @@ def score_row_match(metric: str, row_label: str) -> tuple[float, str | None, boo
         return 0.0, None, False
 
     norm_label = normalize_text(row_label)
+
+    # "Interest income" is a substring of "Net Interest Income" — must not match IE.
+    if metric == "Interest Earned" and "net interest" in norm_label:
+        return 0.0, None, False
+    if metric == "NII" and "net interest margin" in norm_label:
+        return 0.0, None, False
     compact_label = compact(row_label)
 
     best_score = 0.0
     best_alias: str | None = None
     is_exact = False
 
-    for alias in METRIC_ALIASES.get(metric, []):
+    for alias in aliases_for_metric(metric, METRIC_ALIASES):
         norm_alias = normalize_text(alias)
         compact_alias = compact(alias)
 

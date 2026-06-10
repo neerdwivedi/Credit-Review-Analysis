@@ -215,6 +215,9 @@ def canonicalize_table2_period(header: str | None) -> str | None:
     """
     if not header:
         return None
+    # Quarter columns (Q2 FY26, etc.) must never map to H1 — they have their own canon.
+    if canonicalize_quarter_period(header):
+        return None
     if is_table2_period_rejected(header):
         return None
 
