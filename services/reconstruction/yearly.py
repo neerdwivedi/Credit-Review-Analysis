@@ -21,8 +21,8 @@ from services.reconstruction.extractor_core import (
 from services.reconstruction.schema import missing_record
 from utils.constants import DOC_TYPE_ANNUAL_REPORT
 from services.llm_extractor import (
+    is_gemini_available,
     llm_extract_document,
-    is_groq_available,
 )
 
 logger = logging.getLogger("credit_review")
@@ -135,7 +135,8 @@ def extract_yearly_financials(
     periods: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Extract Table 1 (yearly) from annual report PDFs only.
+    Extract Table 1 (yearly) from annual reports, or investor presentations
+    when no annual report was uploaded.
 
     FY25 values prefer FY25 AR; FY24/FY23 prefer FY24 AR then comparative columns in FY25 AR.
     """
@@ -158,25 +159,50 @@ def extract_yearly_financials(
                         metric=metric,
                         period=period,
                         source_document=DOC_TYPE_ANNUAL_REPORT,
-                        failure_reason="no annual report uploaded",
+                        failure_reason="no document uploaded for yearly extraction",
                     )
                 )
         return records
 
     best: dict[tuple[str, str], Any] = {}
 
-    groq_key = None
+    gemini_key = None
     for doc in docs:
         k = getattr(doc, "vision_api_key", None) or ""
-        if is_groq_available(k):
-            groq_key = k
+        if is_gemini_available(k):
+            gemini_key = k
             break
+
+    if gemini_key:
+        gemini_filled = 0
+        for doc in docs:
+            source_document = doc.doc_type or DOC_TYPE_ANNUAL_REPORT
+            llm_hits = llm_extract_document(
+                doc.pages,
+                pdf_bytes=doc.pdf_bytes,
+                filename=doc.filename,
+                api_key=gemini_key,
+                fy_hint=doc.fiscal_year_hint,
+                table_kind="yearly",
+                source_document=source_document,
+                source_file=doc.filename,
+                allowed_periods=periods,
+            )
+            for hit in llm_hits:
+                key = (hit.metric, hit.period)
+                if best.get(key) is None:
+                    best[key] = hit
+                    gemini_filled += 1
+        logger.info("[yearly] Gemini primary: %d values seeded", gemini_filled)
 
     for metric in APPROVED_METRICS:
         for period in periods:
+            if best.get((metric, period)):
+                continue
             ordered_docs = _doc_order_for_period(docs, period)
             for doc in ordered_docs:
                 prepare_document(doc, "yearly")
+                source_document = doc.doc_type or DOC_TYPE_ANNUAL_REPORT
                 try:
                     with pdfplumber.open(io.BytesIO(doc.pdf_bytes)) as pdf:
                         hits = extract_metric_on_document(
@@ -185,7 +211,7 @@ def extract_yearly_financials(
                             metric=metric,
                             periods=(period,),
                             table_kind="yearly",
-                            source_document=DOC_TYPE_ANNUAL_REPORT,
+                            source_document=source_document,
                         )
                         hit = hits.get(period)
                         if hit is None:
@@ -196,6 +222,7 @@ def extract_yearly_financials(
                             cur, hit, period, doc.fiscal_year_hint
                         ):
                             best[key] = hit
+                            break
                 except Exception as exc:
                     logger.exception(
                         "[yearly] Failed %s %s on %s: %s",
@@ -225,6 +252,7 @@ def extract_yearly_financials(
 
     components_best: dict[tuple[str, str], Any] = {}
     for doc in docs:
+        source_document = doc.doc_type or DOC_TYPE_ANNUAL_REPORT
         try:
             with pdfplumber.open(io.BytesIO(doc.pdf_bytes)) as pdf:
                 for component in DERIVATION_COMPONENT_NAMES:
@@ -234,7 +262,7 @@ def extract_yearly_financials(
                         metric=component,
                         periods=periods,
                         table_kind="yearly",
-                        source_document=DOC_TYPE_ANNUAL_REPORT,
+                        source_document=source_document,
                     )
                     merge_component_hits(components_best, hits, component)
         except Exception as exc:
@@ -261,51 +289,15 @@ def extract_yearly_financials(
         logger.info("[yearly] Dropped %d sanity-failed hits", removed)
 
     company_type = getattr(docs[0], "company_type", "nbfc") if docs else "nbfc"
+    yearly_source = (docs[0].doc_type if docs else None) or DOC_TYPE_ANNUAL_REPORT
     apply_yearly_derived_values(
         best,
         periods,
         components_best=components_best,
         company_type=company_type,
         source_file=docs[0].filename if docs else "",
-        source_document=DOC_TYPE_ANNUAL_REPORT,
+        source_document=yearly_source,
     )
-
-    if groq_key:
-        missing_keys = {
-            (metric, period)
-            for metric in APPROVED_METRICS
-            for period in periods
-            if not best.get((metric, period))
-        }
-        if missing_keys:
-            missing_metrics = tuple(dict.fromkeys(m for m, _ in missing_keys))
-            llm_filled = 0
-            for doc in docs:
-                prepare_document(doc, "yearly")
-                llm_hits = llm_extract_document(
-                    doc.pages,
-                    groq_api_key=groq_key,
-                    table_kind="yearly",
-                    source_document=DOC_TYPE_ANNUAL_REPORT,
-                    source_file=doc.filename,
-                    allowed_periods=periods,
-                    metrics_filter=missing_metrics,
-                    only_missing_keys=missing_keys,
-                )
-                for hit in llm_hits:
-                    key = (hit.metric, hit.period)
-                    if key in missing_keys and not best.get(key):
-                        best[key] = hit
-                        missing_keys.discard(key)
-                        llm_filled += 1
-            logger.info(
-                "[yearly] LLM fill-missing: %d values added (%d still missing)",
-                llm_filled,
-                len(missing_keys),
-            )
-        filter_obvious_schedule_noise(best)
-        resolve_yearly_value_collisions(best)
-        filter_invalid_hits(best)
 
     # Single Gemini vision call for ALL missing yearly metrics
     vision_key = None

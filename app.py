@@ -274,19 +274,8 @@ def run_full_pipeline(
         except Exception:
             pass
 
-    groq_key = st.session_state.get("groq_api_key", "")
-    if not groq_key:
-        try:
-            groq_key = st.secrets.get("GROQ_API_KEY", "")
-        except Exception:
-            pass
-
     for res in phase1_results:
-        res["vision_api_key"] = gemini_key
-        # Reuse vision_api_key slot for groq when groq key is present
-        # llm_extractor.py checks is_groq_available() which validates gsk_ prefix
-        if groq_key and groq_key.strip().startswith("gsk_"):
-            res["vision_api_key"] = groq_key
+        res["vision_api_key"] = gemini_key or ""
 
     financial = run_financial_extraction(
         phase1_results,
@@ -374,6 +363,23 @@ def run_full_pipeline(
     # ── end screenshot processing ─────────────────────────────────────────
 
     live.success("Extraction complete — review and approve tables below.")
+
+    from services.llm_extractor import get_last_gemini_error
+
+    gemini_err = get_last_gemini_error()
+    if gemini_err and (
+        "RESOURCE_EXHAUSTED" in gemini_err
+        or "429" in gemini_err
+        or "quota" in gemini_err.lower()
+    ):
+        st.warning(
+            "**Gemini API quota exceeded** — only pdfplumber values were extracted "
+            "(FY24/25 and ratios often missing). Wait 1 hour or until tomorrow, then re-run. "
+            "Check usage at [ai.dev/rate-limit](https://ai.dev/rate-limit). "
+            "Details are in `output/extraction.log`."
+        )
+    elif gemini_err:
+        st.warning(f"Gemini extraction failed: {gemini_err[:240]}")
     return True
 
 
@@ -642,7 +648,7 @@ def render_review_workflow() -> None:
     edited_t1 = _render_review_editor(
         section_title="Yearly Financials",
         section_subtitle=(
-            "From annual report — standalone, March year-end. "
+            "From annual report or investor presentation — standalone, March year-end. "
             f"Periods: {', '.join(TABLE1_PERIODS)}."
         ),
         table_records=table1,
@@ -987,8 +993,9 @@ def _render_phase4_commentary() -> None:
     )
     if groq_key == default_key and default_key:
         st.caption("Using default API key. Replace with your own from console.groq.com if needed.")
+    st.session_state["groq_api_key"] = groq_key
 
-    # Gemini API key for vision extraction fallback
+    # Gemini API key (also set on upload screen; keep in sync here for re-runs)
     default_gemini = ""
     try:
         default_gemini = st.secrets.get("GEMINI_API_KEY", "")
@@ -996,12 +1003,11 @@ def _render_phase4_commentary() -> None:
         pass
 
     gemini_key = st.text_input(
-        "Gemini API Key (for vision extraction fallback)",
+        "Gemini API Key",
         value=default_gemini,
         type="password",
-        placeholder="AIza...",
-        help="Used when pdfplumber cannot extract a value. "
-             "Get free key from aistudio.google.com",
+        placeholder="AQ.... or AIza...",
+        help="Used during PDF extraction. pdfplumber fills any cells Gemini misses.",
         key="gemini_api_key_input",
     )
     if gemini_key == default_gemini and default_gemini:
@@ -1301,8 +1307,9 @@ def render_upload_screen() -> None:
     st.header("Upload Documents")
     st.markdown(
         "PDF only. Multiple files per category allowed. "
-        "**Yearly Financials** uses annual report(s). "
-        "**Half-Year Financials** uses investor presentation(s)."
+        "**Yearly Financials** prefer annual report(s); if none are uploaded, "
+        "the investor presentation is used. "
+        "**Half-Year Financials** use investor presentation(s)."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -1357,7 +1364,7 @@ def render_upload_screen() -> None:
     col1, col2, col3 = st.columns(3)
     with col1:
         annual_uploads = st.file_uploader(
-            "Annual Report PDFs (required)",
+            "Annual Report PDFs (optional)",
             type=["pdf"],
             accept_multiple_files=True,
             key="annual_report",
@@ -1372,7 +1379,7 @@ def render_upload_screen() -> None:
         )
     with col2:
         investor_uploads = st.file_uploader(
-            "Investor Presentation PDFs (required)",
+            "Investor Presentation PDFs (optional if annual report uploaded)",
             type=["pdf"],
             accept_multiple_files=True,
             key="investor_presentation",
@@ -1414,23 +1421,30 @@ def render_upload_screen() -> None:
     st.divider()
     st.subheader("AI Extraction (Recommended)")
     st.caption(
-        "Groq LLM extraction works for any company — banks, NBFCs, HFCs. "
-        "Free key from console.groq.com (takes 30 seconds to get)."
+        "Gemini reads your PDFs visually for financial metrics — banks, NBFCs, HFCs. "
+        "pdfplumber fills any gaps. Free key from aistudio.google.com."
     )
-    default_groq = ""
+    default_gemini = ""
     try:
-        default_groq = st.secrets.get("GROQ_API_KEY", "")
+        default_gemini = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
         pass
-    groq_key_upload = st.text_input(
-        "Groq API Key",
-        value=default_groq,
+    gemini_key_upload = st.text_input(
+        "Gemini API Key",
+        value=default_gemini,
         type="password",
-        placeholder="gsk_...",
-        help="Used for LLM-based extraction. Falls back to pdfplumber if not provided.",
-        key="groq_api_key_upload",
+        placeholder="AQ.... or AIza...",
+        help="Primary PDF extraction via Gemini File API. pdfplumber runs afterward for missing cells.",
+        key="gemini_api_key_upload",
     )
-    st.session_state["groq_api_key"] = groq_key_upload
+    st.session_state["gemini_api_key"] = gemini_key_upload
+    if gemini_key_upload == default_gemini and default_gemini:
+        st.caption(
+            "Using default Gemini key from secrets. "
+            "Replace with your own from aistudio.google.com if needed."
+        )
+    elif not gemini_key_upload:
+        st.caption("Optional — without a key, pdfplumber-only extraction still runs.")
 
     run_clicked = st.button("Run Extraction", type="primary")
 
@@ -1439,10 +1453,12 @@ def render_upload_screen() -> None:
         return
 
     missing = []
-    if not annual_files and not ann_imgs:
-        missing.append("at least one Annual Report PDF or screenshot")
-    if not investor_files and not inv_imgs:
-        missing.append("at least one Investor Presentation PDF or screenshot")
+    has_annual = bool(annual_files or ann_imgs)
+    has_investor = bool(investor_files or inv_imgs)
+    if not has_annual and not has_investor:
+        missing.append(
+            "at least one Annual Report or Investor Presentation (PDF or screenshot)"
+        )
     if missing:
         st.error("Please upload: " + ", ".join(missing))
         return

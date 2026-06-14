@@ -21,8 +21,8 @@ from services.reconstruction.extractor_core import (
 from services.reconstruction.schema import missing_record
 from utils.constants import DOC_TYPE_INVESTOR_PRESENTATION
 from services.llm_extractor import (
+    is_gemini_available,
     llm_extract_document,
-    is_groq_available,
 )
 from data.financial_logic import derive_h1_values, METRIC_TYPE, MetricType
 from data.metric_aliases import get_quarter_periods
@@ -80,7 +80,7 @@ def _score_half_year_hit(hit: ExtractionHit, period: str) -> float:
         score -= 0.5
     if hit.metric in _H1_FLOW_METRICS and col_hdr.startswith("Q"):
         score -= 0.6
-    if (hit.source_section or "") == "groq_llm":
+    if (hit.source_section or "") in ("groq_llm", "gemini_file_api"):
         score -= 0.35
     if (hit.source_section or "").startswith("derived:"):
         score -= 0.05
@@ -331,12 +331,32 @@ def extract_half_year_financials(
                 )
         return records
 
-    groq_key = None
+    gemini_key = None
     for doc in investor_presentations:
         k = getattr(doc, "vision_api_key", None) or ""
-        if is_groq_available(k):
-            groq_key = k
+        if is_gemini_available(k):
+            gemini_key = k
             break
+
+    if gemini_key:
+        gemini_filled = 0
+        for doc in investor_presentations:
+            llm_hits = llm_extract_document(
+                doc.pages,
+                pdf_bytes=doc.pdf_bytes,
+                filename=doc.filename,
+                api_key=gemini_key,
+                table_kind="half_year",
+                source_document=DOC_TYPE_INVESTOR_PRESENTATION,
+                source_file=doc.filename,
+                allowed_periods=periods,
+            )
+            for hit in llm_hits:
+                key = (hit.metric, hit.period)
+                if best.get(key) is None:
+                    best[key] = hit
+                    gemini_filled += 1
+        logger.info("[half_year] Gemini primary: %d values seeded", gemini_filled)
 
     for doc in investor_presentations:
         prepare_document(doc, "half_year")
@@ -348,20 +368,22 @@ def extract_half_year_financials(
                     merge_component_hits,
                 )
 
-                # H1 columns only — never read Q2 into the review table.
+                # H1 columns only — fill gaps Gemini missed.
                 for metric in APPROVED_METRICS:
+                    missing_h1 = [p for p in periods if not best.get((metric, p))]
+                    if not missing_h1:
+                        continue
                     hits = extract_metric_on_document(
                         doc,
                         pdf,
                         metric=metric,
-                        periods=periods,
+                        periods=tuple(missing_h1),
                         table_kind="half_year",
                         source_document=DOC_TYPE_INVESTOR_PRESENTATION,
                     )
                     for period, hit in hits.items():
                         key = (metric, period)
-                        cur = best.get(key)
-                        if _prefer_half_year_hit(cur, hit, period):
+                        if best.get(key) is None:
                             best[key] = hit
 
                 for component in DERIVATION_COMPONENT_NAMES:
@@ -421,40 +443,6 @@ def extract_half_year_financials(
             source_document=DOC_TYPE_INVESTOR_PRESENTATION,
             table="half_year",
         )
-
-    if groq_key:
-        missing_keys = {
-            (metric, period)
-            for metric in APPROVED_METRICS
-            for period in periods
-            if not best.get((metric, period))
-        }
-        if missing_keys:
-            missing_metrics = tuple(dict.fromkeys(m for m, _ in missing_keys))
-            llm_filled = 0
-            for doc in investor_presentations:
-                prepare_document(doc, "half_year")
-                llm_hits = llm_extract_document(
-                    doc.pages,
-                    groq_api_key=groq_key,
-                    table_kind="half_year",
-                    source_document=DOC_TYPE_INVESTOR_PRESENTATION,
-                    source_file=doc.filename,
-                    allowed_periods=periods,
-                    metrics_filter=missing_metrics,
-                    only_missing_keys=missing_keys,
-                )
-                for hit in llm_hits:
-                    key = (hit.metric, hit.period)
-                    if key in missing_keys and not best.get(key):
-                        best[key] = hit
-                        missing_keys.discard(key)
-                        llm_filled += 1
-            logger.info(
-                "[half_year] LLM fill-missing: %d values added (%d still missing)",
-                llm_filled,
-                len(missing_keys),
-            )
 
     untrusted = filter_untrusted_source_hits(best)
     if untrusted:

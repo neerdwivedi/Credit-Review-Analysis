@@ -145,11 +145,19 @@ def run_financial_extraction(
         _status("Reading uploaded annual report…")
         _status("Scanning financial sections…")
         _status("Detecting standalone financial statements…")
-    logger.info("[V2] Flow A — yearly (%d annual reports)", len(annual))
+    elif investor:
+        _status("No annual report — using investor presentation for yearly metrics…")
+
+    yearly_docs = annual if annual else investor
+    logger.info(
+        "[V2] Flow A — yearly (%d doc(s), source=%s)",
+        len(yearly_docs),
+        "annual_report" if annual else ("investor_presentation" if investor else "none"),
+    )
     _status("Extracting yearly financial metrics…")
     _status("Matching PAT, NII, borrowings and deposits…")
     table1_records = extract_yearly_financials(
-        annual,
+        yearly_docs,
         periods=TABLE1_PERIODS,
     )
 
