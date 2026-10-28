@@ -1,3 +1,14 @@
+---
+title: Credit Review Analysis
+emoji: 📊
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: "1.32.0"
+app_file: app.py
+pinned: false
+---
+
 # Credit Review Report Generator
 
 Streamlit app for credit analysts: upload annual reports and investor presentations, extract financial metrics, review and approve values, then generate commentary and Word reports.
