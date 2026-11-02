@@ -186,3 +186,6 @@ data/*.pdf
 uploads/
 output/
 data/*.pdf
+
+# Page-classifier training intermediates (extracted PDF text) — never commit
+ann/_data/

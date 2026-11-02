@@ -1,0 +1,82 @@
+Page classifier: TF-IDF + Keras MLP (Dense 256 -> 128 -> 3)
+Seed 42, max_features 5000, batch 64, label order ['pnl', 'balance_sheet', 'other']
+
+Phase 1 fit  (6 companies, 6972 pages): pnl=35  balance_sheet=34  other=6903
+Phase 1 val  (2 companies: Bajaj group, HDFC Bank; 1315 pages): pnl=8  balance_sheet=8  other=1299
+Final train  (8 companies, 8287 pages): pnl=43  balance_sheet=42  other=8202
+Test         (5 companies: ICICI Bank, Muthoot Finance, PNB Housing Finance, Shriram Finance, State Bank of India; 2261 pages): pnl=11  balance_sheet=10  other=2240
+Class weights (phase 1): pnl=66.40, balance_sheet=68.35, other=0.34
+
+Phase 1: ran 16 epochs; best validation statement F1 0.895 at epoch 8
+Validation statement F1 by epoch: 0.51 0.64 0.64 0.63 0.63 0.70 0.66 0.90 0.66 0.66 0.66 0.66 0.66 0.61 0.61 0.66
+
+--- Validation companies (phase 1 model, best epoch) ---
+               precision    recall  f1-score   support
+
+          pnl      1.000     0.750     0.857         8
+balance_sheet      1.000     0.875     0.933         8
+        other      0.998     1.000     0.999      1299
+
+     accuracy                          0.998      1315
+    macro avg      0.999     0.875     0.930      1315
+ weighted avg      0.998     0.998     0.998      1315
+
+Confusion matrix (rows = true, columns = predicted):
+true \ pred                pnl  balance_sheet          other
+pnl                          6              0              2
+balance_sheet                0              7              1
+other                        0              0           1299
+
+Statement macro F1 (pnl, balance_sheet): 0.895
+Accuracy: 0.9977
+
+--- TEST: held-out companies (final model) ---
+               precision    recall  f1-score   support
+
+          pnl      1.000     0.818     0.900        11
+balance_sheet      0.889     0.800     0.842        10
+        other      0.998     1.000     0.999      2240
+
+     accuracy                          0.998      2261
+    macro avg      0.962     0.873     0.914      2261
+ weighted avg      0.998     0.998     0.998      2261
+
+Confusion matrix (rows = true, columns = predicted):
+true \ pred                pnl  balance_sheet          other
+pnl                          9              0              2
+balance_sheet                0              8              2
+other                        0              1           2239
+
+Statement macro F1 (pnl, balance_sheet): 0.871
+Accuracy: 0.9978
+
+Why accuracy is not the headline: 99.07% of test pages are `other`, so a model that never predicts a statement scores 99.07% accuracy with zero recall on pnl and balance_sheet. Per-class precision/recall/F1 show whether statements are actually found.
+
+--- Baseline: keyword/line-item rules (auto_label) on the same test pages ---
+               precision    recall  f1-score   support
+
+          pnl      0.909     0.909     0.909        11
+balance_sheet      1.000     1.000     1.000        10
+        other      1.000     1.000     1.000      2240
+
+     accuracy                          0.999      2261
+    macro avg      0.970     0.970     0.970      2261
+ weighted avg      0.999     0.999     0.999      2261
+
+Confusion matrix (rows = true, columns = predicted):
+true \ pred                pnl  balance_sheet          other
+pnl                         10              0              1
+balance_sheet                0             10              0
+other                        1              0           2239
+
+Statement macro F1 (pnl, balance_sheet): 0.955
+Accuracy: 0.9991
+
+Caveat: test labels were hand-checked starting from these rule labels, so this baseline is biased upward; it differs from the hand labels on only the corrected pages.
+
+Test errors (5):
+  ICICI Bank             p147  true=balance_sheet  pred=other
+  ICICI Bank             p265  true=balance_sheet  pred=other
+  ICICI Bank             p266  true=pnl            pred=other
+  Muthoot Finance        p303  true=pnl            pred=other
+  Shriram Finance        p471  true=other          pred=balance_sheet
